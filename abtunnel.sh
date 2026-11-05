@@ -452,6 +452,25 @@ EOF
   log "Persisted; re-applied on boot. Remove with:  sudo bash abtunnel.sh down forward"
 }
 
+# ----------------------------------------------------- full uninstall
+cmd_uninstall() {
+  need_root
+  cmd_down forward 2>/dev/null || true
+  systemctl disable --now abtunnel-stunnel abtunnel-ssh abtunnel-openvpn \
+    abtunnel-gre abtunnel-ipip abtunnel-sit abtunnel-gre6 abtunnel-ip6ip6 \
+    abtunnel-forward abtunnel-health.timer abtunnel-health 2>/dev/null || true
+  ipsec stop 2>/dev/null || true
+  systemctl stop strongswan-starter strongswan 2>/dev/null || true
+  wg-quick down wg0 2>/dev/null || true
+  local i; for i in tun0 gre1 ipip1 sit1 gre6 ip6t1 wg0; do ip link del "$i" 2>/dev/null || true; done
+  rm -f /etc/systemd/system/abtunnel-*.service /etc/systemd/system/abtunnel-health.timer
+  systemctl daemon-reload
+  rm -rf /etc/abtunnel /opt/tunxall
+  rm -f /etc/sysctl.d/99-abtunnel-fwd.conf /etc/wireguard/wg0.conf /etc/ipsec.conf /etc/ipsec.secrets
+  rm -f /usr/local/bin/abtunnel /usr/local/bin/netcheck /usr/local/bin/wg-tunnel
+  log "Fully removed: all tunnels, services, configs, and commands."
+}
+
 # -------------------------------------------------------------------- misc
 cmd_status() {
   echo "== abtunnel units =="; systemctl --no-pager --type=service 2>/dev/null | grep -E 'abtunnel|strongswan|ipsec|openvpn' || echo "  (none)"
@@ -595,6 +614,7 @@ main() {
     advanced) menu_advanced;;
     connect) cmd_connect "${1:-}";;
     status) cmd_status;;
+    uninstall) cmd_uninstall;;
     down) cmd_down "${1:-}";;
     health) parse_args "$@"; health_install;;
     forward) parse_args "$@"; cmd_forward;;
@@ -607,7 +627,7 @@ main() {
     gre6)    local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup gre6 "$role";;
     ip6ip6)  local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup ip6ip6 "$role";;
     openvpn) local role="${1:-}"; shift || true; parse_args "$@"; [[ $role == server ]] && openvpn_server || openvpn_client;;
-    *) echo "Usage: $0 {menu|connect <token>|advanced|stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn|forward|health|status|down} ..."; echo "Easiest:  sudo $0   (opens the menu)"; exit 1;;
+    *) echo "Usage: $0 {menu|connect <token>|advanced|stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn|forward|health|status|down|uninstall} ..."; echo "Easiest:  sudo $0   (opens the menu)"; exit 1;;
   esac
 }
 main "$@"
