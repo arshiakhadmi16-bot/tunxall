@@ -42,8 +42,13 @@ done
 
 log "Installed to $DEST and linked into $BIN"
 echo
-echo -e "${c_y}To set up a tunnel, just run:   sudo abtunnel${c_0}"
-echo "  - On the SERVER  (public IP): choose 1 — it prints a TOKEN."
-echo "  - On the CLIENT:              choose 2 and paste that token. Done."
-echo
-echo "Diagnostics (optional):  netcheck server  /  netcheck probe --target <IP>"
+echo -e "${c_y}Installed. Opening the menu...${c_0}"
+echo "  1) Set up a tunnel (guided): choose role -> IPv4/IPv6 -> protocol."
+echo "  Re-open anytime with:  sudo abtunnel"
+echo "  Diagnostics (optional):  netcheck server  /  netcheck probe --target <IP>"
+
+# auto-open the interactive menu (read from the real terminal even when piped via curl)
+if [ -e /dev/tty ] && [ -r /dev/tty ]; then
+  echo
+  abtunnel < /dev/tty
+fi

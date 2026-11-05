@@ -537,30 +537,111 @@ cmd_connect() {
   fi
 }
 
-# -------------------------------------------------------- easy interactive menu
+# -------------------------------------------------------- guided setup wizard
+client_test_ip() { # proto -> tunnel IP to ping (empty = none)
+  case "$1" in
+    openvpn) echo 10.30.0.1;; wireguard) echo 10.10.0.1;;
+    gre) echo 10.20.0.1;; ipip) echo 10.40.0.1;;
+    sit) echo fd60::1;; gre6) echo fd20::1;; ip6ip6) echo fd40::1;;
+    *) echo "";;
+  esac
+}
+
+report_client() { # proto — test reachability and report; returns to menu either way
+  local proto="$1" t p6=""
+  echo; log "Testing the tunnel..."; sleep 2
+  case "$proto" in
+    stunnel|ssh)
+      if [[ -n $LOCAL_PORT ]] && timeout 3 bash -c "echo >/dev/tcp/127.0.0.1/$LOCAL_PORT" 2>/dev/null; then
+        log "SUCCESS — local port $LOCAL_PORT is open; tunnel is working."
+      else
+        warn "Tunnel NOT confirmed (local port ${LOCAL_PORT:-?} not open). Back to the main menu."
+      fi
+      return 0;;
+  esac
+  t=$(client_test_ip "$proto")
+  [[ -z $t ]] && { log "Configured. (no automatic reachability test for $proto)"; return 0; }
+  [[ $t == *:* ]] && p6="-6"
+  if ping $p6 -c3 -W2 "$t" >/dev/null 2>&1; then
+    log "SUCCESS — tunnel is up (peer $t reachable)."
+  else
+    warn "Tunnel did NOT come up (no reply from $t)."
+    warn "Back to the main menu — run setup again or pick another protocol."
+  fi
+}
+
+wizard_guided() {
+  local role fam p
+  echo; echo "This server is the:"
+  echo "  1) SERVER  — has a public IP; the other side connects TO it"
+  echo "  2) CLIENT  — connects OUT to the server"
+  read -rp "> " role
+  [[ $role == 1 || $role == 2 ]] || { warn "invalid choice"; return 0; }
+  echo; echo "Tunnel endpoints over:"
+  echo "  1) IPv4"
+  echo "  2) IPv6"
+  read -rp "> " fam
+  echo
+  if [[ $fam == 1 ]]; then
+    echo "Protocol (IPv4):"
+    echo "  1) openvpn    2) wireguard   3) stunnel (TLS)   4) ssh"
+    echo "  5) ipsec      6) gre         7) ipip            8) sit (6in4)"
+    read -rp "> " p
+    case "$p" in 1) p=openvpn;; 2) p=wireguard;; 3) p=stunnel;; 4) p=ssh;; 5) p=ipsec;; 6) p=gre;; 7) p=ipip;; 8) p=sit;; *) warn "invalid choice"; return 0;; esac
+  elif [[ $fam == 2 ]]; then
+    echo "Protocol (IPv6):"
+    echo "  1) gre6       2) ip6ip6"
+    read -rp "> " p
+    case "$p" in 1) p=gre6;; 2) p=ip6ip6;; *) warn "invalid choice"; return 0;; esac
+  else
+    warn "invalid choice"; return 0
+  fi
+
+  if [[ $role == 1 ]]; then   # ---- SERVER side ----
+    case "$p" in
+      openvpn)   read -rp "UDP port [51820]: " OVPN_PORT; OVPN_PORT=${OVPN_PORT:-51820}; ( openvpn_server ) || warn "setup failed — back to menu";;
+      wireguard) read -rp "UDP port [51820]: " WGP; WGP=${WGP:-51820}; ( wg-tunnel server --port "$WGP" ) || warn "setup failed — back to menu";;
+      stunnel)   read -rp "Public TLS port [443]: " ACCEPT_PORT; ACCEPT_PORT=${ACCEPT_PORT:-443}; read -rp "Local service port to expose: " SERVICE_PORT; ( stunnel_server ) || warn "setup failed — back to menu";;
+      ssh)       read -rp "Client public key (blank to add later): " PUBKEY; ( ssh_server ) || warn "setup failed — back to menu";;
+      ipsec)     read -rp "Client public IP: " PEER; ( ipsec_setup server ) || warn "setup failed — back to menu";;
+      gre|ipip|sit|gre6|ip6ip6) read -rp "Client endpoint IP: " PEER; read -rp "Shared PSK (blank = unencrypted): " PSK; ( iface_tunnel_setup "$p" server ) || warn "setup failed — back to menu";;
+    esac
+  else                        # ---- CLIENT side ----
+    case "$p" in
+      openvpn)   echo "Paste the token from the server and press Enter:"; read -r tok; ( cmd_connect "$tok" ) || warn "connect failed — back to menu"; return 0;;
+      wireguard) read -rp "Server public IP: " PEER; read -rp "UDP port [51820]: " WGP; WGP=${WGP:-51820}; read -rp "Server public key: " PUBKEY; ( wg-tunnel client --endpoint "$PEER" --port "$WGP" --pubkey "$PUBKEY" ) || warn "setup failed — back to menu";;
+      stunnel)   read -rp "Server public IP: " PEER; read -rp "Public TLS port [443]: " ACCEPT_PORT; ACCEPT_PORT=${ACCEPT_PORT:-443}; read -rp "Local port on this machine: " LOCAL_PORT; read -rp "server-cert.pem path: " CERT; ( stunnel_client ) || warn "setup failed — back to menu";;
+      ssh)       read -rp "Server public IP: " PEER; read -rp "SSH port [22]: " SSH_PORT; SSH_PORT=${SSH_PORT:-22}; read -rp "Local port on this machine: " LOCAL_PORT; read -rp "Remote host [127.0.0.1]: " THOST; THOST=${THOST:-127.0.0.1}; read -rp "Remote port: " RPORT; ( ssh_client ) || warn "setup failed — back to menu";;
+      ipsec)     read -rp "Server public IP: " PEER; read -rp "PSK from server: " PSK; ( ipsec_setup client ) || warn "setup failed — back to menu";;
+      gre|ipip|sit|gre6|ip6ip6) read -rp "Server endpoint IP: " PEER; read -rp "Shared PSK (same as server; blank = unencrypted): " PSK; ( iface_tunnel_setup "$p" client ) || warn "setup failed — back to menu";;
+    esac
+    report_client "$p"
+  fi
+  return 0
+}
+
+# -------------------------------------------------------- main interactive menu
 wizard() {
   need_root
   while true; do
     echo
     echo "================= tunxall ================="
-    echo "  1) Set up this machine as SERVER  (has a public IP)"
-    echo "  2) Connect this machine as CLIENT (paste a token)"
-    echo "  3) Show status"
-    echo "  4) Add a port-forward (send a port into the tunnel)"
-    echo "  5) Enable auto-restart watchdog"
-    echo "  6) Remove a tunnel"
-    echo "  7) Advanced menu (all tunnel types)"
+    echo "  1) Set up a tunnel (guided)"
+    echo "  2) Show status"
+    echo "  3) Add a port-forward"
+    echo "  4) Enable auto-restart watchdog"
+    echo "  5) Remove a tunnel"
+    echo "  6) Uninstall everything"
     echo "  0) Exit"
     echo "==========================================="
     read -rp "Choose: " c
     case "$c" in
-      1) echo "This machine will be the SERVER."; read -rp "UDP port [51820]: " OVPN_PORT; OVPN_PORT=${OVPN_PORT:-51820}; openvpn_server;;
-      2) echo "Paste the token from the server and press Enter:"; read -r tok; cmd_connect "$tok";;
-      3) cmd_status;;
-      4) read -rp "Incoming port on this machine: " IN_PORT; read -rp "Peer tunnel IP [10.30.0.1]: " TO; TO=${TO:-10.30.0.1}; read -rp "Service port on peer: " TO_PORT; read -rp "Protocol tcp/udp [tcp]: " PROTO; PROTO=${PROTO:-tcp}; cmd_forward;;
-      5) read -rp "Unit [abtunnel-openvpn]: " UNIT; UNIT=${UNIT:-abtunnel-openvpn}; read -rp "Peer tunnel IP to ping [10.30.0.1]: " WATCH_IP; WATCH_IP=${WATCH_IP:-10.30.0.1}; health_install;;
-      6) read -rp "Which (stunnel/ssh/ipsec/gre/ipip/sit/gre6/ip6ip6/openvpn/forward): " d; cmd_down "$d";;
-      7) menu_advanced;;
+      1) wizard_guided || true;;
+      2) cmd_status;;
+      3) read -rp "Incoming port on this machine: " IN_PORT; read -rp "Peer tunnel IP [10.30.0.1]: " TO; TO=${TO:-10.30.0.1}; read -rp "Service port on peer: " TO_PORT; read -rp "Protocol tcp/udp [tcp]: " PROTO; PROTO=${PROTO:-tcp}; ( cmd_forward ) || warn "failed";;
+      4) read -rp "Unit [abtunnel-openvpn]: " UNIT; UNIT=${UNIT:-abtunnel-openvpn}; read -rp "Peer tunnel IP to ping [10.30.0.1]: " WATCH_IP; WATCH_IP=${WATCH_IP:-10.30.0.1}; ( health_install ) || warn "failed";;
+      5) read -rp "Which (stunnel/ssh/ipsec/gre/ipip/sit/gre6/ip6ip6/openvpn/forward): " d; ( cmd_down "$d" ) || warn "failed";;
+      6) read -rp "Remove EVERYTHING? type 'yes': " yn; [[ $yn == yes ]] && cmd_uninstall || warn "cancelled";;
       0) exit 0;;
       *) warn "invalid choice";;
     esac
