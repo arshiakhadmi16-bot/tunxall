@@ -11,14 +11,12 @@
 #   On B (listener):   sudo bash netcheck.sh server [--ports "22 80 443 8080 51820 2048"]
 #   On A (prober):     sudo bash netcheck.sh probe --target <B_IP> [--ports "..."]
 #   Stop listener:     sudo bash netcheck.sh stop
-#
-# Needs: nc (netcat), optionally iperf3 for accurate throughput (auto-detected).
 set -euo pipefail
 
-PORTS_DEFAULT="22 80 443 853 993 2048 2096 5201 8080 8443 51820"
+PORTS_DEFAULT="22 80 443 853 993 2048 2096 8080 8443 51820"
 PORTS="$PORTS_DEFAULT"
 TARGET=""
-IPERF_PORT=5201
+IPERF_PORT=5201            # reserved for iperf3 only (never used as an nc probe port)
 PIDDIR=/tmp/netcheck
 mkdir -p "$PIDDIR"
 
@@ -47,7 +45,7 @@ ensure_tools() {
     log "Installing netcat..."
     apt-get update -qq && apt-get install -y -qq netcat-openbsd >/dev/null 2>&1 || warn "install nc manually"
   fi
-  need iperf3 || warn "iperf3 not found — throughput test will fall back to a rough nc transfer. Install with: apt-get install -y iperf3"
+  need iperf3 || { log "Installing iperf3..."; apt-get install -y -qq iperf3 >/dev/null 2>&1 || warn "install iperf3 manually for throughput"; }
 }
 
 # ---------------------------------------------------------------- server (B)
@@ -56,21 +54,18 @@ cmd_server() {
   ensure_tools
   log "Starting listeners on B for ports: $PORTS"
   for p in $PORTS; do
-    # TCP listener that echoes a banner then stays briefly open (for cut-detection)
-    nohup bash -c "while true; do echo \"OPEN:$p\" | nc -l -p $p -q1 2>/dev/null || break; done" \
-      >/dev/null 2>&1 &
+    [[ "$p" == "$IPERF_PORT" ]] && continue   # don't collide with iperf3
+    nohup bash -c "while true; do echo \"OPEN:$p\" | nc -l -p $p -q1 2>/dev/null || break; done" >/dev/null 2>&1 &
     echo $! >> "$PIDDIR/tcp.pids"
-    # UDP listener
-    nohup bash -c "while true; do echo \"UOPEN:$p\" | nc -u -l -p $p -q1 2>/dev/null || break; done" \
-      >/dev/null 2>&1 &
+    nohup bash -c "while true; do echo \"UOPEN:$p\" | nc -u -l -p $p -q1 2>/dev/null || break; done" >/dev/null 2>&1 &
     echo $! >> "$PIDDIR/udp.pids"
   done
   if need iperf3; then
     nohup iperf3 -s -p $IPERF_PORT >/dev/null 2>&1 &
     echo $! >> "$PIDDIR/iperf.pids"
-    log "iperf3 server up on $IPERF_PORT"
+    log "iperf3 server up on $IPERF_PORT (TCP+UDP throughput)"
   fi
-  log "Listeners running. Now run the probe on A. Stop later with: sudo bash netcheck.sh stop"
+  log "Listeners running. Run the probe on A, then stop here with: sudo bash netcheck.sh stop"
 }
 
 cmd_stop() {
@@ -80,18 +75,19 @@ cmd_stop() {
     rm -f "$f"
   done
   pkill -f "nc -l -p" 2>/dev/null || true
+  pkill -f "nc -u -l -p" 2>/dev/null || true
   pkill -f "iperf3 -s" 2>/dev/null || true
   log "Listeners stopped."
 }
 
 # ---------------------------------------------------------------- probe (A)
+OPEN_TCP=""
 probe_tcp() {
   echo "== TCP ports =="
   for p in $PORTS; do
-    # -w2 timeout; distinguish refused (BLOCKED) vs timeout (FILTERED/drop)
+    [[ "$p" == "$IPERF_PORT" ]] && continue
     out=$(timeout 3 bash -c "echo '' | nc -w2 $TARGET $p 2>&1" || true)
-    rc=$?
-    if echo "$out" | grep -q "OPEN:$p"; then ok "$p/tcp  (banner received)"
+    if echo "$out" | grep -q "OPEN:$p"; then ok "$p/tcp  (banner received)"; OPEN_TCP="$OPEN_TCP $p"
     elif echo "$out" | grep -qi "refused"; then bad "$p/tcp  (connection refused)"
     else filt "$p/tcp"
     fi
@@ -101,9 +97,10 @@ probe_tcp() {
 probe_udp() {
   echo "== UDP ports =="
   for p in $PORTS; do
+    [[ "$p" == "$IPERF_PORT" ]] && continue
     out=$(timeout 3 bash -c "echo ping | nc -u -w2 $TARGET $p 2>&1" || true)
     if echo "$out" | grep -q "UOPEN:$p"; then ok "$p/udp  (reply received)"
-    else filt "$p/udp  (UDP rarely replies; confirm with iperf/tcpdump on B)"
+    else filt "$p/udp  (UDP often silent; confirm with iperf/tcpdump on B)"
     fi
   done
 }
@@ -116,7 +113,7 @@ probe_icmp() {
 
 probe_mtu() {
   echo "== Path MTU (DF probe) =="
-  local hi=1472 lo=1200 best=0
+  local best=0 sz
   for sz in 1472 1400 1300 1200; do
     if ping -c1 -W2 -M do -s $sz "$TARGET" >/dev/null 2>&1; then best=$((sz+28)); break; fi
   done
@@ -125,23 +122,27 @@ probe_mtu() {
 }
 
 probe_throughput() {
-  echo "== Throughput =="
-  if need iperf3; then
-    log "TCP throughput (10s)..."; iperf3 -c "$TARGET" -p $IPERF_PORT -t 10 2>/dev/null | tail -4 || warn "iperf3 TCP failed (port $IPERF_PORT may be blocked)"
-    log "UDP throughput (10s, 50M target)..."; iperf3 -c "$TARGET" -p $IPERF_PORT -u -b 50M -t 10 2>/dev/null | tail -4 || warn "iperf3 UDP failed"
-  else
-    warn "iperf3 missing on A — skipping accurate throughput. Install it on both ends for real numbers."
-  fi
+  echo "== Throughput (iperf3 on $IPERF_PORT) =="
+  if ! need iperf3; then warn "iperf3 missing on A — install on both ends for real numbers"; return; fi
+  log "TCP up (4 parallel streams, 10s)..."
+  iperf3 -c "$TARGET" -p $IPERF_PORT -P 4 -t 10 2>/dev/null | grep -E 'SUM|receiver|sender' | tail -2 \
+    || warn "iperf3 TCP up failed (port $IPERF_PORT may be blocked, or server not running on B)"
+  log "TCP down (reverse, 10s)..."
+  iperf3 -c "$TARGET" -p $IPERF_PORT -R -t 10 2>/dev/null | grep -E 'receiver' | tail -1 \
+    || warn "iperf3 reverse failed"
+  log "UDP (up to 200M, 10s)..."
+  iperf3 -c "$TARGET" -p $IPERF_PORT -u -b 200M -t 10 2>/dev/null | grep -E 'receiver|%' | tail -1 \
+    || warn "iperf3 UDP failed"
 }
 
 probe_cut() {
   echo "== Long-lived connection stability =="
-  # hold an open TCP connection ~15s and see if it survives (stateful inspection often cuts idle/long flows)
-  local p; p=$(echo $PORTS | awk '{print $1}')
+  local p; p=$(echo $OPEN_TCP | awk '{print $1}')
+  [[ -z $p ]] && p=$(echo $PORTS | awk '{print $1}')
   if timeout 20 bash -c "exec 3<>/dev/tcp/$TARGET/$p && sleep 15 && echo alive >&3" 2>/dev/null; then
     ok "held a $p/tcp connection for 15s without reset"
   else
-    warn "connection on $p/tcp dropped during the 15s hold (possible idle timeout or stateful cut)"
+    warn "connection on $p/tcp dropped during the 15s hold (idle timeout or stateful cut)"
   fi
 }
 
@@ -157,8 +158,8 @@ cmd_probe() {
   probe_throughput
   probe_cut
   echo "======================================================="
-  log "Summary: OPEN ports are usable; FILTERED = silently dropped; BLOCKED = actively refused."
-  log "Pick an OPEN high-throughput port and use a standard encrypted tunnel on it."
+  log "OPEN ports:${OPEN_TCP:-  none}"
+  log "Pick an OPEN port with the best throughput and set up a standard tunnel on it (abtunnel menu)."
 }
 
 main() {

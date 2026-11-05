@@ -65,11 +65,30 @@ sudo abtunnel down <stunnel|ssh|ipsec>
 
 ---
 
-## سه نوع تانل — چه موقع کدوم؟
+## انواع تانل استاندارد — چه موقع کدوم؟
 
-- **stunnel (TLS):** یه سرویس TCP خاص (مثلاً دیتابیس) رو امن بین دو سرور رد کن. رمزنگاری واقعی TLS با cert پین‌شده.
+- **stunnel (TLS):** یه سرویس TCP خاص (مثلاً دیتابیس) رو امن بین دو سرور رد کن. TLS واقعی با cert پین‌شده.
 - **ssh:** ساده‌ترین؛ یه پورت رو forward می‌کنه. پایدار با autossh.
-- **ipsec:** کل ترافیک IP بین دو سرور رو رمز می‌کنه (host-to-host). شبیه VPN ولی بدون اینترفیس مجازی.
+- **ipsec:** کل ترافیک IP بین دو سرور رو رمز می‌کنه (host-to-host، transport mode).
+- **gre + ipsec:** اینترفیس point-to-point با IP خصوصی، رمزنگاری‌شده با IPsec. برای روت کردن کل ترافیک بین دو سرور.
+- **ipip + ipsec:** مثل GRE ولی سبک‌تر (فقط IPv4 unicast).
+- **openvpn:** تانل point-to-point با static key و AES-256 روی UDP.
+- **WireGuard:** توی `wg-tunnel` جداگانه.
+
+> نکته: `gre` و `ipip` بدون `--psk` **رمزنگاری نمی‌شن**. همیشه `--psk` بده تا با IPsec رمز بشن.
+
+## 🔁 Health watchdog (ری‌استارت خودکار روی قطعی)
+
+علاوه بر `Restart=always` که systemd می‌ده، می‌تونی یه نگهبان نصب کنی که هر ۳۰ ثانیه سلامت تانل رو چک کنه و اگه ترافیک رد نشد، همون تانل رو ری‌استارت کنه:
+
+```bash
+# برای تانل‌هایی که IP خصوصی دارن (gre/ipip/openvpn):
+sudo abtunnel health --unit abtunnel-gre --watch-ip 10.20.0.1
+# برای تانل‌های port-forward (stunnel/ssh):
+sudo abtunnel health --unit abtunnel-stunnel --watch-port 3306
+```
+
+> این فقط همون تانل رو دوباره وصل می‌کنه (پایداری). بین نوع پروتکل‌ها سوییچ نمی‌کنه.
 
 ### اجرای مستقیم (بدون منو)
 
@@ -98,6 +117,24 @@ sudo abtunnel ssh server --pubkey "<A_PUBLIC_KEY>"
 sudo abtunnel ipsec server --peer <A_IP>
 # روی A
 sudo abtunnel ipsec client --peer <B_IP> --psk "<PSK_FROM_B>"
+```
+
+**gre یا ipip (روی IPsec):**
+```bash
+# روی B  (یه PSK چاپ می‌کنه)
+sudo abtunnel gre server --peer <A_IP> --psk "<یه PSK یا خالی تا تولید شه>"
+# روی A
+sudo abtunnel gre client --peer <B_IP> --psk "<PSK_FROM_B>"
+# تست:  ping 10.20.0.1   (ipip -> 10.40.0.1)
+```
+
+**openvpn — point-to-point:**
+```bash
+# روی B  (یه key چاپ می‌کنه)
+sudo abtunnel openvpn server --ovpn-port 1194
+# key رو به A کپی کن، بعد روی A:
+sudo abtunnel openvpn client --peer <B_IP> --ovpn-port 1194 --cert /etc/abtunnel/ovpn.key
+# تست:  ping 10.30.0.1
 ```
 
 **wg-tunnel — WireGuard:**

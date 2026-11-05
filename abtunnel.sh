@@ -1,24 +1,29 @@
 #!/usr/bin/env bash
 # abtunnel.sh — Standard encrypted tunnels between two servers you own.
 #
-# Three independent, standard transports you pick from a menu (no obfuscation,
-# no auto protocol-switching — you choose one and it connects):
+# Pick ONE standard transport (no obfuscation, no auto protocol-switching):
 #
-#   1) stunnel  — forward a TCP service over real TLS 1.3 (cert-pinned).
-#   2) ssh      — persistent port-forward over SSH (autossh + systemd).
-#   3) ipsec    — host-to-host encrypted link via strongSwan (PSK, transport mode).
+#   stunnel  — forward a TCP service over real TLS (cert-pinned).
+#   ssh      — persistent port-forward over SSH (autossh + systemd).
+#   ipsec    — host-to-host encrypted link via strongSwan (PSK, transport mode).
+#   gre      — GRE point-to-point interface, encrypted by IPsec (give --psk).
+#   ipip     — IPIP point-to-point interface, encrypted by IPsec (give --psk).
+#   openvpn  — point-to-point OpenVPN tunnel (static key, AES-256).
+#   (WireGuard lives in wg-tunnel.sh.)
 #
-# Each runs under systemd with auto-restart so it survives drops and reboots.
+# Every tunnel runs under systemd with aggressive auto-restart, and an optional
+# health watchdog restarts it if the link stops passing traffic.
 #
 # Quick start:   sudo bash abtunnel.sh menu
-# Direct use:    sudo bash abtunnel.sh <stunnel|ssh|ipsec> <server|client> [flags]
-# Teardown:      sudo bash abtunnel.sh down <stunnel|ssh|ipsec>
-# Status:        sudo bash abtunnel.sh status
+# Direct:        sudo bash abtunnel.sh <type> <server|client> [flags]
+# Watchdog:      sudo bash abtunnel.sh health --unit <unit> --watch-ip <ip>|--watch-port <port>
+# Status/down:   sudo bash abtunnel.sh status | down <type>
 set -euo pipefail
 
 DIR=/etc/abtunnel
 PEER=""; ACCEPT_PORT=443; SERVICE_PORT=""; LOCAL_PORT=""; SSH_PORT=22
-THOST=127.0.0.1; RPORT=""; PSK=""; PUBKEY=""; CERT=""
+THOST=127.0.0.1; RPORT=""; PSK=""; PUBKEY=""; CERT=""; OVPN_PORT=1194
+WATCH_IP=""; WATCH_PORT=""; UNIT=""
 
 c_g="\e[32m"; c_r="\e[31m"; c_y="\e[33m"; c_0="\e[0m"
 log()  { echo -e "${c_g}[+]${c_0} $*"; }
@@ -45,18 +50,25 @@ parse_args() {
       --psk)          PSK="$2"; shift 2;;
       --pubkey)       PUBKEY="$2"; shift 2;;
       --cert)         CERT="$2"; shift 2;;
+      --ovpn-port)    OVPN_PORT="$2"; shift 2;;
+      --watch-ip)     WATCH_IP="$2"; shift 2;;
+      --watch-port)   WATCH_PORT="$2"; shift 2;;
+      --unit)         UNIT="$2"; shift 2;;
       *) die "Unknown flag: $1";;
     esac
   done
 }
 
-mkunit() { # name execstart
+local_ip_to() { ip -4 route get "$1" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}'; }
+
+mkunit() { # name execstart...
   local name="$1"; shift
   cat > "/etc/systemd/system/$name.service" <<EOF
 [Unit]
 Description=abtunnel $name
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=$*
@@ -72,13 +84,37 @@ EOF
   systemctl restart "$name.service"
 }
 
+mkoneshot() { # name upscript downscript
+  local name="$1" up="$2" down="$3"
+  cat > "/etc/systemd/system/$name.service" <<EOF
+[Unit]
+Description=abtunnel $name
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$up
+ExecStop=$down
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable "$name.service" >/dev/null 2>&1 || true
+  systemctl restart "$name.service"
+}
+
 stunnel_bin() { command -v stunnel4 || command -v stunnel || die "stunnel not found"; }
 
 # ----------------------------------------------------------------- stunnel
 stunnel_server() {
-  need_root; apt_install stunnel4 openssl
-  mkdir -p $DIR && chmod 700 $DIR
-  [[ -n $SERVICE_PORT ]] || die "stunnel server needs --service-port (the local TCP service on B to expose)"
+  need_root; apt_install stunnel4 openssl; mkdir -p $DIR && chmod 700 $DIR
+  [[ -n $SERVICE_PORT ]] || die "stunnel server needs --service-port (local TCP service on B to expose)"
   if [[ ! -f $DIR/server.pem ]]; then
     openssl req -new -x509 -days 3650 -nodes -newkey rsa:2048 \
       -keyout $DIR/server.pem -out $DIR/server.pem -subj "/CN=abtunnel" >/dev/null 2>&1
@@ -94,20 +130,17 @@ connect = 127.0.0.1:$SERVICE_PORT
 cert = $DIR/server.pem
 EOF
   mkunit abtunnel-stunnel "$(stunnel_bin) $DIR/stunnel.conf"
-  log "stunnel server up: TLS on :$ACCEPT_PORT -> 127.0.0.1:$SERVICE_PORT"
-  echo -e "${c_y}Copy this cert to A as /etc/abtunnel/server-cert.pem, then run the client:${c_0}"
-  echo "----8<---- $DIR/server-cert.pem ----8<----"
-  cat $DIR/server-cert.pem
-  echo "----8<-------------------------------------8<----"
+  log "stunnel server up: TLS :$ACCEPT_PORT -> 127.0.0.1:$SERVICE_PORT"
+  echo -e "${c_y}Copy this cert to A as /etc/abtunnel/server-cert.pem:${c_0}"
+  echo "----8<----"; cat $DIR/server-cert.pem; echo "----8<----"
   echo "On A:  sudo bash abtunnel.sh stunnel client --peer <B_IP> --accept-port $ACCEPT_PORT --local-port <LPORT> --cert /etc/abtunnel/server-cert.pem"
 }
 
 stunnel_client() {
-  need_root; apt_install stunnel4
-  mkdir -p $DIR && chmod 700 $DIR
+  need_root; apt_install stunnel4; mkdir -p $DIR && chmod 700 $DIR
   [[ -n $PEER ]] || die "need --peer <B_IP>"
-  [[ -n $LOCAL_PORT ]] || die "need --local-port (where the tunneled service appears on A)"
-  [[ -n $CERT && -f $CERT ]] || die "need --cert <path to server-cert.pem copied from B>"
+  [[ -n $LOCAL_PORT ]] || die "need --local-port"
+  [[ -n $CERT && -f $CERT ]] || die "need --cert <server-cert.pem copied from B>"
   cp "$CERT" $DIR/server-cert.pem
   cat > $DIR/stunnel.conf <<EOF
 foreground = yes
@@ -121,7 +154,7 @@ connect = $PEER:$ACCEPT_PORT
 EOF
   mkunit abtunnel-stunnel "$(stunnel_bin) $DIR/stunnel.conf"
   log "stunnel client up: 127.0.0.1:$LOCAL_PORT -> TLS -> $PEER:$ACCEPT_PORT"
-  log "Point your app on A at 127.0.0.1:$LOCAL_PORT"
+  log "Health watchdog:  sudo bash abtunnel.sh health --unit abtunnel-stunnel --watch-port $LOCAL_PORT"
 }
 
 # --------------------------------------------------------------------- ssh
@@ -133,51 +166,35 @@ ssh_server() {
     chmod 600 /root/.ssh/authorized_keys
     log "Added A's public key to /root/.ssh/authorized_keys"
   else
-    log "SSH server side just needs sshd (already running) and A's key."
-    warn "Re-run with --pubkey \"<A_PUBLIC_KEY>\" once A prints it, or paste it into /root/.ssh/authorized_keys."
+    warn "Re-run with --pubkey \"<A_PUBLIC_KEY>\" once A prints it."
   fi
-  log "Ensure sshd listens on port $SSH_PORT and that port is open."
 }
 
 ssh_client() {
-  need_root; apt_install autossh openssh-client
-  mkdir -p $DIR && chmod 700 $DIR
+  need_root; apt_install autossh openssh-client; mkdir -p $DIR && chmod 700 $DIR
   [[ -n $PEER ]] || die "need --peer <B_IP>"
-  [[ -n $LOCAL_PORT ]] || die "need --local-port (local port on A)"
-  [[ -n $RPORT ]] || die "need --remote-port (service port reachable from B, e.g. a DB port)"
-  if [[ ! -f $DIR/id_ed25519 ]]; then
-    ssh-keygen -t ed25519 -N "" -f $DIR/id_ed25519 >/dev/null
-  fi
+  [[ -n $LOCAL_PORT ]] || die "need --local-port"
+  [[ -n $RPORT ]] || die "need --remote-port"
+  [[ -f $DIR/id_ed25519 ]] || ssh-keygen -t ed25519 -N "" -f $DIR/id_ed25519 >/dev/null
   mkunit abtunnel-ssh \
     "/usr/bin/autossh -M 0 -N -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
 -o StrictHostKeyChecking=accept-new -o ExitOnForwardFailure=yes \
 -i $DIR/id_ed25519 -p $SSH_PORT -L $LOCAL_PORT:$THOST:$RPORT root@$PEER"
-  log "ssh tunnel up: 127.0.0.1:$LOCAL_PORT -> (via $PEER:$SSH_PORT) -> $THOST:$RPORT"
-  echo -e "${c_y}Give B this public key so it accepts the tunnel:${c_0}"
-  echo "----8<----"
-  cat $DIR/id_ed25519.pub
-  echo "----8<----"
+  log "ssh tunnel up: 127.0.0.1:$LOCAL_PORT -> ($PEER:$SSH_PORT) -> $THOST:$RPORT"
+  echo -e "${c_y}Give B this key:${c_0}"; echo "----8<----"; cat $DIR/id_ed25519.pub; echo "----8<----"
   echo "On B:  sudo bash abtunnel.sh ssh server --pubkey \"$(cat $DIR/id_ed25519.pub)\""
 }
 
 # ------------------------------------------------------------------- ipsec
 ipsec_setup() {
-  local role="$1"
-  need_root; apt_install strongswan
+  local role="$1"; need_root; apt_install strongswan openssl
   [[ -n $PEER ]] || die "need --peer <other server's public IP>"
-  local myip
-  myip=$(ip -4 route get "$PEER" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
-  [[ -n $myip ]] || die "could not determine local IP toward $PEER"
-  if [[ $role == server ]]; then
-    PSK=${PSK:-$(openssl rand -hex 24)}
-    log "Generated PSK (give this to A):  $PSK"
-  else
-    [[ -n $PSK ]] || die "client needs --psk <value printed by B>"
-  fi
+  local myip; myip=$(local_ip_to "$PEER"); [[ -n $myip ]] || die "cannot find local IP toward $PEER"
+  if [[ $role == server ]]; then PSK=${PSK:-$(openssl rand -hex 24)}; log "IPsec PSK (give to the other side):  $PSK"
+  else [[ -n $PSK ]] || die "client needs --psk <value from server>"; fi
   cat > /etc/ipsec.conf <<EOF
 config setup
   charondebug="ike 1, knl 1"
-
 conn abtunnel
   authby=secret
   auto=start
@@ -190,32 +207,165 @@ conn abtunnel
   dpdaction=restart
   closeaction=restart
 EOF
-  cat > /etc/ipsec.secrets <<EOF
-$myip $PEER : PSK "$PSK"
-EOF
-  chmod 600 /etc/ipsec.secrets
+  echo "$myip $PEER : PSK \"$PSK\"" > /etc/ipsec.secrets; chmod 600 /etc/ipsec.secrets
   systemctl enable strongswan-starter >/dev/null 2>&1 || systemctl enable strongswan >/dev/null 2>&1 || true
   (ipsec restart || systemctl restart strongswan-starter || systemctl restart strongswan) >/dev/null 2>&1 || true
   sleep 2
-  log "IPsec transport-mode link configured between $myip and $PEER."
-  log "All IP traffic between the two servers is now encrypted. Check: sudo ipsec status"
+  log "IPsec transport link configured between $myip and $PEER. Check: sudo ipsec status"
+}
+
+# -------------------------------------------------------------- gre / ipip
+ip_tunnel_setup() { # mode(gre|ipip) role(server|client)
+  local mode="$1" role="$2"; need_root; apt_install iproute2
+  [[ -n $PEER ]] || die "need --peer <other server's public IP>"
+  local myip net ifn myaddr peeraddr
+  myip=$(local_ip_to "$PEER"); [[ -n $myip ]] || die "cannot find local IP toward $PEER"
+  if [[ $mode == gre ]]; then ifn=gre1; net=10.20.0; else ifn=ipip1; net=10.40.0; fi
+  if [[ $role == server ]]; then myaddr=$net.1; peeraddr=$net.2; else myaddr=$net.2; peeraddr=$net.1; fi
+
+  if [[ -n $PSK ]]; then
+    log "Encrypting the $mode link with IPsec first..."
+    ipsec_setup "$role"
+  else
+    warn "No --psk given: the $mode tunnel will be UNENCRYPTED. Add --psk to protect it with IPsec."
+  fi
+
+  cat > $DIR/$ifn-up.sh <<EOF
+#!/usr/bin/env bash
+ip link del $ifn 2>/dev/null || true
+ip tunnel add $ifn mode $mode local $myip remote $PEER ttl 255
+ip addr add $myaddr/30 dev $ifn
+ip link set $ifn mtu 1400 up
+EOF
+  cat > $DIR/$ifn-down.sh <<EOF
+#!/usr/bin/env bash
+ip link set $ifn down 2>/dev/null || true
+ip tunnel del $ifn 2>/dev/null || true
+EOF
+  mkdir -p $DIR; chmod +x $DIR/$ifn-up.sh $DIR/$ifn-down.sh
+  mkoneshot "abtunnel-$mode" "$DIR/$ifn-up.sh" "$DIR/$ifn-down.sh"
+  log "$mode tunnel up: this side $myaddr <-> peer $peeraddr (iface $ifn)"
+  log "Test:  ping -c3 $peeraddr"
+  log "Health watchdog:  sudo bash abtunnel.sh health --unit abtunnel-$mode --watch-ip $peeraddr"
+}
+
+# ----------------------------------------------------------------- openvpn
+openvpn_server() {
+  need_root; apt_install openvpn; mkdir -p $DIR && chmod 700 $DIR
+  [[ -f $DIR/ovpn.key ]] || openvpn --genkey secret $DIR/ovpn.key 2>/dev/null || openvpn --genkey --secret $DIR/ovpn.key
+  cat > $DIR/ovpn.conf <<EOF
+dev tun
+proto udp
+port $OVPN_PORT
+ifconfig 10.30.0.1 10.30.0.2
+secret $DIR/ovpn.key
+cipher AES-256-CBC
+auth SHA256
+keepalive 10 60
+persist-key
+persist-tun
+EOF
+  mkunit abtunnel-openvpn "$(command -v openvpn) --config $DIR/ovpn.conf"
+  log "OpenVPN server up on udp/$OVPN_PORT, private IP 10.30.0.1"
+  echo -e "${c_y}Copy this key to A as /etc/abtunnel/ovpn.key:${c_0}"
+  echo "----8<----"; cat $DIR/ovpn.key; echo "----8<----"
+  echo "On A:  sudo bash abtunnel.sh openvpn client --peer <B_IP> --ovpn-port $OVPN_PORT --cert /etc/abtunnel/ovpn.key"
+}
+
+openvpn_client() {
+  need_root; apt_install openvpn; mkdir -p $DIR && chmod 700 $DIR
+  [[ -n $PEER ]] || die "need --peer <B_IP>"
+  [[ -n $CERT && -f $CERT ]] || die "need --cert <ovpn.key copied from B>"
+  cp "$CERT" $DIR/ovpn.key; chmod 600 $DIR/ovpn.key
+  cat > $DIR/ovpn.conf <<EOF
+dev tun
+proto udp
+remote $PEER $OVPN_PORT
+ifconfig 10.30.0.2 10.30.0.1
+secret $DIR/ovpn.key
+cipher AES-256-CBC
+auth SHA256
+keepalive 10 60
+persist-key
+persist-tun
+EOF
+  mkunit abtunnel-openvpn "$(command -v openvpn) --config $DIR/ovpn.conf"
+  log "OpenVPN client up, private IP 10.30.0.2 (peer 10.30.0.1)"
+  log "Test:  ping -c3 10.30.0.1"
+  log "Health watchdog:  sudo bash abtunnel.sh health --unit abtunnel-openvpn --watch-ip 10.30.0.1"
+}
+
+# ----------------------------------------------------- health watchdog
+health_install() {
+  need_root; mkdir -p $DIR
+  [[ -n $UNIT ]] || die "need --unit <systemd unit, e.g. abtunnel-gre>"
+  [[ -n $WATCH_IP || -n $WATCH_PORT ]] || die "need --watch-ip <ip> or --watch-port <local tcp port>"
+  local mode target
+  if [[ -n $WATCH_IP ]]; then mode=ip; target=$WATCH_IP; else mode=port; target=$WATCH_PORT; fi
+  cat > "$DIR/health-$UNIT.env" <<EOF
+UNIT=$UNIT
+MODE=$mode
+TARGET=$target
+EOF
+  cat > $DIR/healthcheck.sh <<'EOF'
+#!/usr/bin/env bash
+for f in /etc/abtunnel/health-*.env; do
+  [[ -e $f ]] || continue
+  UNIT=""; MODE=""; TARGET=""; . "$f"
+  ok=1
+  if [[ $MODE == ip ]]; then
+    ping -c2 -W2 "$TARGET" >/dev/null 2>&1 || ok=0
+  else
+    timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/$TARGET" 2>/dev/null || ok=0
+  fi
+  if [[ $ok -eq 0 ]]; then
+    logger -t abtunnel-health "restarting $UNIT (health check to $TARGET failed)"
+    systemctl restart "$UNIT"
+  fi
+done
+EOF
+  chmod +x $DIR/healthcheck.sh
+  cat > /etc/systemd/system/abtunnel-health.service <<EOF
+[Unit]
+Description=abtunnel health watchdog
+[Service]
+Type=oneshot
+ExecStart=$DIR/healthcheck.sh
+EOF
+  cat > /etc/systemd/system/abtunnel-health.timer <<EOF
+[Unit]
+Description=abtunnel health watchdog timer
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=30
+AccuracySec=5
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now abtunnel-health.timer
+  log "Watchdog active: every 30s it checks $target ($mode) and restarts $UNIT if the link is down."
 }
 
 # -------------------------------------------------------------------- misc
 cmd_status() {
-  echo "== systemd units =="; systemctl --no-pager --type=service 2>/dev/null | grep -E 'abtunnel|strongswan|ipsec' || echo "  (none)"
+  echo "== abtunnel units =="; systemctl --no-pager --type=service 2>/dev/null | grep -E 'abtunnel|strongswan|ipsec|openvpn' || echo "  (none)"
+  echo "== watchdog =="; systemctl --no-pager list-timers abtunnel-health.timer 2>/dev/null | head -2 || true
   echo "== ipsec =="; ipsec status 2>/dev/null || echo "  (strongSwan not active)"
+  echo "== tunnel interfaces =="; ip -brief addr show 2>/dev/null | grep -E 'gre1|ipip1|tun|wg0' || echo "  (none)"
 }
 
 cmd_down() {
-  local what="${1:-}"
-  case "$what" in
+  case "${1:-}" in
     stunnel) systemctl disable --now abtunnel-stunnel.service 2>/dev/null || true;;
     ssh)     systemctl disable --now abtunnel-ssh.service 2>/dev/null || true;;
+    openvpn) systemctl disable --now abtunnel-openvpn.service 2>/dev/null || true;;
+    gre)     systemctl disable --now abtunnel-gre.service 2>/dev/null || true;;
+    ipip)    systemctl disable --now abtunnel-ipip.service 2>/dev/null || true;;
     ipsec)   ipsec stop 2>/dev/null || systemctl stop strongswan-starter 2>/dev/null || systemctl stop strongswan 2>/dev/null || true;;
-    *) die "Usage: down <stunnel|ssh|ipsec>";;
+    *) die "Usage: down <stunnel|ssh|ipsec|gre|ipip|openvpn>";;
   esac
-  log "stopped: $what"
+  log "stopped: ${1:-}"
 }
 
 # -------------------------------------------------------------------- menu
@@ -224,22 +374,23 @@ menu() {
   echo "=============================================="
   echo " abtunnel — standard encrypted tunnel setup"
   echo "=============================================="
-  echo "Role:"; echo "  1) server (the side with a public IP that receives)"; echo "  2) client (the side that connects out)"
-  read -rp "Choose role [1-2]: " r
-  echo "Tunnel type:"; echo "  1) stunnel (TLS TCP forward)"; echo "  2) ssh (port-forward)"; echo "  3) ipsec (host-to-host)"
-  read -rp "Choose type [1-3]: " t
+  echo "Role:  1) server (public IP, receives)   2) client (connects out)"
+  read -rp "Role [1-2]: " r
+  echo "Type:  1) stunnel (TLS)   2) ssh   3) ipsec   4) gre+ipsec   5) ipip+ipsec   6) openvpn"
+  read -rp "Type [1-6]: " t
   case "$r-$t" in
-    1-1) read -rp "Public TLS port [443]: " ACCEPT_PORT; ACCEPT_PORT=${ACCEPT_PORT:-443}
-         read -rp "Local service port to expose (e.g. 3306): " SERVICE_PORT; stunnel_server;;
-    2-1) read -rp "B public IP: " PEER; read -rp "Public TLS port [443]: " ACCEPT_PORT; ACCEPT_PORT=${ACCEPT_PORT:-443}
-         read -rp "Local port on A: " LOCAL_PORT; read -rp "Path to server-cert.pem from B: " CERT; stunnel_client;;
-    2-2) read -rp "SSH port on B [22]: " SSH_PORT; SSH_PORT=${SSH_PORT:-22}
-         read -rp "B public IP: " PEER; read -rp "Local port on A: " LOCAL_PORT
-         read -rp "Remote service host [127.0.0.1]: " THOST; THOST=${THOST:-127.0.0.1}
-         read -rp "Remote service port: " RPORT; ssh_client;;
-    1-2) read -rp "Paste A's public key (or leave blank to add later): " PUBKEY; ssh_server;;
-    1-3) read -rp "Other server (A) public IP: " PEER; ipsec_setup server;;
-    2-3) read -rp "Other server (B) public IP: " PEER; read -rp "PSK from B: " PSK; ipsec_setup client;;
+    1-1) read -rp "Public TLS port [443]: " ACCEPT_PORT; ACCEPT_PORT=${ACCEPT_PORT:-443}; read -rp "Local service port to expose: " SERVICE_PORT; stunnel_server;;
+    2-1) read -rp "B public IP: " PEER; read -rp "Public TLS port [443]: " ACCEPT_PORT; ACCEPT_PORT=${ACCEPT_PORT:-443}; read -rp "Local port on A: " LOCAL_PORT; read -rp "server-cert.pem path: " CERT; stunnel_client;;
+    1-2) read -rp "A's public key (blank to add later): " PUBKEY; ssh_server;;
+    2-2) read -rp "SSH port on B [22]: " SSH_PORT; SSH_PORT=${SSH_PORT:-22}; read -rp "B public IP: " PEER; read -rp "Local port on A: " LOCAL_PORT; read -rp "Remote host [127.0.0.1]: " THOST; THOST=${THOST:-127.0.0.1}; read -rp "Remote port: " RPORT; ssh_client;;
+    1-3) read -rp "A public IP: " PEER; ipsec_setup server;;
+    2-3) read -rp "B public IP: " PEER; read -rp "PSK from B: " PSK; ipsec_setup client;;
+    1-4) read -rp "A public IP: " PEER; ip_tunnel_setup gre server;;
+    2-4) read -rp "B public IP: " PEER; read -rp "PSK from B: " PSK; ip_tunnel_setup gre client;;
+    1-5) read -rp "A public IP: " PEER; ip_tunnel_setup ipip server;;
+    2-5) read -rp "B public IP: " PEER; read -rp "PSK from B: " PSK; ip_tunnel_setup ipip client;;
+    1-6) read -rp "OpenVPN udp port [1194]: " OVPN_PORT; OVPN_PORT=${OVPN_PORT:-1194}; openvpn_server;;
+    2-6) read -rp "B public IP: " PEER; read -rp "OpenVPN udp port [1194]: " OVPN_PORT; OVPN_PORT=${OVPN_PORT:-1194}; read -rp "ovpn.key path: " CERT; openvpn_client;;
     *) die "invalid selection";;
   esac
 }
@@ -250,10 +401,14 @@ main() {
     menu) menu;;
     status) cmd_status;;
     down) cmd_down "${1:-}";;
+    health) parse_args "$@"; health_install;;
     stunnel) local role="${1:-}"; shift || true; parse_args "$@"; [[ $role == server ]] && stunnel_server || stunnel_client;;
     ssh)     local role="${1:-}"; shift || true; parse_args "$@"; [[ $role == server ]] && ssh_server || ssh_client;;
     ipsec)   local role="${1:-}"; shift || true; parse_args "$@"; ipsec_setup "$role";;
-    *) echo "Usage: $0 {menu|stunnel|ssh|ipsec|status|down} ..."; echo "Easiest:  sudo bash $0 menu"; exit 1;;
+    gre)     local role="${1:-}"; shift || true; parse_args "$@"; ip_tunnel_setup gre "$role";;
+    ipip)    local role="${1:-}"; shift || true; parse_args "$@"; ip_tunnel_setup ipip "$role";;
+    openvpn) local role="${1:-}"; shift || true; parse_args "$@"; [[ $role == server ]] && openvpn_server || openvpn_client;;
+    *) echo "Usage: $0 {menu|stunnel|ssh|ipsec|gre|ipip|openvpn|health|status|down} ..."; echo "Easiest:  sudo bash $0 menu"; exit 1;;
   esac
 }
 main "$@"
