@@ -42,7 +42,8 @@ done
 
 log "Installed to $DEST and linked into $BIN"
 echo
-echo -e "${c_y}Next steps:${c_0}"
-echo "  1) Diagnose the path:   netcheck server   (on B)   /   netcheck probe --target <B_IP>   (on A)"
-echo "  2) Bring up a tunnel:   abtunnel menu"
-echo "  3) Status / teardown:   abtunnel status   /   abtunnel down <stunnel|ssh|ipsec>"
+echo -e "${c_y}To set up a tunnel, just run:   sudo abtunnel${c_0}"
+echo "  - On the SERVER  (public IP): choose 1 — it prints a TOKEN."
+echo "  - On the CLIENT:              choose 2 and paste that token. Done."
+echo
+echo "Diagnostics (optional):  netcheck server  /  netcheck probe --target <IP>"

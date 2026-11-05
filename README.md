@@ -16,6 +16,19 @@ curl -fsSL https://raw.githubusercontent.com/arshiakhadmi16-bot/tunxall/main/ins
 
 This installs three global commands: `netcheck`, `abtunnel`, `wg-tunnel`.
 
+### ساده‌ترین راه (توکنی، شبیه Backhaul)
+
+```bash
+sudo abtunnel
+```
+
+- روی **سرور** (که IP عمومی داره): گزینه‌ی **۱** رو بزن → یه **توکن** چاپ می‌کنه.
+- روی **کلاینت**: گزینه‌ی **۲** رو بزن و اون توکن رو **Paste** کن. تمام — خودش تانل رو بالا میاره و تست می‌کنه.
+
+بدون scp، بدون رمز، بدون فلگ. (این مسیر ساده از OpenVPN استفاده می‌کنه.)
+
+برای تانل‌های دیگه (stunnel/ssh/ipsec/gre/…)، توی منو گزینه‌ی **۷ (Advanced)** یا دستورهای زیر.
+
 ---
 
 ## Components

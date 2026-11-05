@@ -70,6 +70,12 @@ parse_args() {
 
 ip_family() { case "$1" in *:*) echo 6;; *) echo 4;; esac; }
 local_ip_to() { local f; f=$(ip_family "$1"); ip -"$f" route get "$1" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}'; }
+detect_pubip() {
+  local ip
+  ip=$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)
+  [[ -z $ip ]] && ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')
+  echo "$ip"
+}
 
 mkunit() { # name execstart...
   local name="$1"; shift
@@ -304,9 +310,15 @@ EOF
   mkunit abtunnel-openvpn "$(command -v openvpn) --config $DIR/ovpn.conf"
   enable_forwarding
   log "OpenVPN server up on udp/$OVPN_PORT, private IP 10.30.0.1"
-  echo -e "${c_y}Copy this key to A as /etc/abtunnel/ovpn.key:${c_0}"
-  echo "----8<----"; cat $DIR/ovpn.key; echo "----8<----"
-  echo "On A:  sudo bash abtunnel.sh openvpn client --peer <B_IP> --ovpn-port $OVPN_PORT --cert /etc/abtunnel/ovpn.key"
+  local pub token
+  pub=$(detect_pubip)
+  token=$(printf 'T=openvpn;PEER=%s;PORT=%s;KEY=%s' "$pub" "$OVPN_PORT" "$(base64 -w0 $DIR/ovpn.key)" | base64 -w0)
+  echo
+  echo -e "${c_y}==================== CONNECTION TOKEN ====================${c_0}"
+  echo "$token"
+  echo -e "${c_y}==========================================================${c_0}"
+  echo "On the CLIENT machine run:   sudo abtunnel connect <paste-token-here>"
+  echo "or just run 'sudo abtunnel' on the client and choose option 2."
 }
 
 openvpn_client() {
@@ -476,11 +488,71 @@ cmd_down() {
   log "stopped: ${1:-}"
 }
 
-# -------------------------------------------------------------------- menu
-menu() {
+# ------------------------------------------------- connect from token (client)
+cmd_connect() {
+  need_root; apt_install openvpn coreutils
+  local tok="${1:-}"; [[ -n $tok ]] || die "usage: abtunnel connect <TOKEN>"
+  local dec; dec=$(printf '%s' "$tok" | base64 -d 2>/dev/null) || die "invalid token"
+  local T="" P_PEER="" P_PORT="" P_KEY="" kv
+  local IFS=';'; read -ra parts <<< "$dec"; unset IFS
+  for kv in "${parts[@]}"; do
+    case "$kv" in
+      T=*)    T="${kv#T=}";;
+      PEER=*) P_PEER="${kv#PEER=}";;
+      PORT=*) P_PORT="${kv#PORT=}";;
+      KEY=*)  P_KEY="${kv#KEY=}";;
+    esac
+  done
+  [[ $T == openvpn ]] || die "unsupported token type: ${T:-?}"
+  [[ -n $P_PEER && -n $P_PORT && -n $P_KEY ]] || die "token is missing fields"
+  mkdir -p $DIR && chmod 700 $DIR
+  printf '%s' "$P_KEY" | base64 -d > $DIR/ovpn.key; chmod 600 $DIR/ovpn.key
+  PEER=$P_PEER; OVPN_PORT=$P_PORT; CERT=$DIR/ovpn.key
+  openvpn_client
+  echo; log "Testing the tunnel..."; sleep 2
+  if ip -br addr show 2>/dev/null | grep -q '^tun' && ping -c3 -W2 10.30.0.1 >/dev/null 2>&1; then
+    log "SUCCESS — tunnel is up. Peer reachable at 10.30.0.1 (this side 10.30.0.2)."
+    ip route get 10.30.0.1 2>/dev/null | grep -q 'dev tun' && log "Traffic to 10.30.0.1 goes through the tunnel." || warn "Note: 10.30.0.1 may also be reachable via your LAN; tunnel interface is up regardless."
+  else
+    warn "Tunnel not confirmed yet. Check:  sudo systemctl status abtunnel-openvpn"
+  fi
+}
+
+# -------------------------------------------------------- easy interactive menu
+wizard() {
+  need_root
+  while true; do
+    echo
+    echo "================= tunxall ================="
+    echo "  1) Set up this machine as SERVER  (has a public IP)"
+    echo "  2) Connect this machine as CLIENT (paste a token)"
+    echo "  3) Show status"
+    echo "  4) Add a port-forward (send a port into the tunnel)"
+    echo "  5) Enable auto-restart watchdog"
+    echo "  6) Remove a tunnel"
+    echo "  7) Advanced menu (all tunnel types)"
+    echo "  0) Exit"
+    echo "==========================================="
+    read -rp "Choose: " c
+    case "$c" in
+      1) echo "This machine will be the SERVER."; read -rp "UDP port [51820]: " OVPN_PORT; OVPN_PORT=${OVPN_PORT:-51820}; openvpn_server;;
+      2) echo "Paste the token from the server and press Enter:"; read -r tok; cmd_connect "$tok";;
+      3) cmd_status;;
+      4) read -rp "Incoming port on this machine: " IN_PORT; read -rp "Peer tunnel IP [10.30.0.1]: " TO; TO=${TO:-10.30.0.1}; read -rp "Service port on peer: " TO_PORT; read -rp "Protocol tcp/udp [tcp]: " PROTO; PROTO=${PROTO:-tcp}; cmd_forward;;
+      5) read -rp "Unit [abtunnel-openvpn]: " UNIT; UNIT=${UNIT:-abtunnel-openvpn}; read -rp "Peer tunnel IP to ping [10.30.0.1]: " WATCH_IP; WATCH_IP=${WATCH_IP:-10.30.0.1}; health_install;;
+      6) read -rp "Which (stunnel/ssh/ipsec/gre/ipip/sit/gre6/ip6ip6/openvpn/forward): " d; cmd_down "$d";;
+      7) menu_advanced;;
+      0) exit 0;;
+      *) warn "invalid choice";;
+    esac
+  done
+}
+
+# ------------------------------------------------------ advanced menu (by type)
+menu_advanced() {
   need_root
   echo "=============================================="
-  echo " abtunnel — standard encrypted tunnel setup"
+  echo " abtunnel — advanced setup (all tunnel types)"
   echo "=============================================="
   echo "Role:  1) server (public IP, receives)   2) client (connects out)"
   read -rp "Role [1-2]: " r
@@ -519,7 +591,9 @@ menu() {
 main() {
   local a="${1:-}"; shift || true
   case "$a" in
-    menu) menu;;
+    ""|menu|wizard) wizard;;
+    advanced) menu_advanced;;
+    connect) cmd_connect "${1:-}";;
     status) cmd_status;;
     down) cmd_down "${1:-}";;
     health) parse_args "$@"; health_install;;
@@ -533,7 +607,7 @@ main() {
     gre6)    local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup gre6 "$role";;
     ip6ip6)  local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup ip6ip6 "$role";;
     openvpn) local role="${1:-}"; shift || true; parse_args "$@"; [[ $role == server ]] && openvpn_server || openvpn_client;;
-    *) echo "Usage: $0 {menu|stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn|forward|health|status|down} ..."; echo "Easiest:  sudo bash $0 menu"; exit 1;;
+    *) echo "Usage: $0 {menu|connect <token>|advanced|stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn|forward|health|status|down} ..."; echo "Easiest:  sudo $0   (opens the menu)"; exit 1;;
   esac
 }
 main "$@"
