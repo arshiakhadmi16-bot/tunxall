@@ -160,7 +160,7 @@ stunnel_client() {
   [[ -n $PEER ]] || die "need --peer <B_IP>"
   [[ -n $LOCAL_PORT ]] || die "need --local-port"
   [[ -n $CERT && -f $CERT ]] || die "need --cert <server-cert.pem copied from B>"
-  cp "$CERT" $DIR/server-cert.pem
+  [[ "$CERT" -ef "$DIR/server-cert.pem" ]] || cp "$CERT" "$DIR/server-cert.pem"
   cat > $DIR/stunnel.conf <<EOF
 foreground = yes
 pid =
@@ -313,7 +313,8 @@ openvpn_client() {
   need_root; apt_install openvpn; mkdir -p $DIR && chmod 700 $DIR
   [[ -n $PEER ]] || die "need --peer <B_IP>"
   [[ -n $CERT && -f $CERT ]] || die "need --cert <ovpn.key copied from B>"
-  cp "$CERT" $DIR/ovpn.key; chmod 600 $DIR/ovpn.key
+  [[ "$CERT" -ef "$DIR/ovpn.key" ]] || cp "$CERT" "$DIR/ovpn.key"
+  chmod 600 "$DIR/ovpn.key"
   cat > $DIR/ovpn.conf <<EOF
 dev tun
 proto udp
