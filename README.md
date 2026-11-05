@@ -70,12 +70,15 @@ sudo abtunnel down <stunnel|ssh|ipsec>
 - **stunnel (TLS):** یه سرویس TCP خاص (مثلاً دیتابیس) رو امن بین دو سرور رد کن. TLS واقعی با cert پین‌شده.
 - **ssh:** ساده‌ترین؛ یه پورت رو forward می‌کنه. پایدار با autossh.
 - **ipsec:** کل ترافیک IP بین دو سرور رو رمز می‌کنه (host-to-host، transport mode).
-- **gre + ipsec:** اینترفیس point-to-point با IP خصوصی، رمزنگاری‌شده با IPsec. برای روت کردن کل ترافیک بین دو سرور.
-- **ipip + ipsec:** مثل GRE ولی سبک‌تر (فقط IPv4 unicast).
+- **gre:** اینترفیس point-to-point روی IPv4 (IP داخلی `10.20.0.x`).
+- **ipip:** مثل GRE ولی سبک‌تر، روی IPv4 (`10.40.0.x`).
+- **sit (6in4):** IPv6 روی endpoint ‌ِ IPv4 (IP داخلی `fd60::x`).
+- **gre6:** GRE روی endpoint ‌ِ IPv6 (IP داخلی `fd20::x`).
+- **ip6ip6:** IPv6-in-IPv6 (IP داخلی `fd40::x`).
 - **openvpn:** تانل point-to-point با static key و AES-256 روی UDP.
 - **WireGuard:** توی `wg-tunnel` جداگانه.
 
-> نکته: `gre` و `ipip` بدون `--psk` **رمزنگاری نمی‌شن**. همیشه `--psk` بده تا با IPsec رمز بشن.
+> نکته‌ی مهم: `gre`/`ipip`/`sit`/`gre6`/`ip6ip6` بدون `--psk` **رمزنگاری نمی‌شن** (plain). با دادن یه `--psk` مشترک (یک مقدار روی هر دو طرف) با IPsec رمز می‌شن.
 
 ## 🔁 Health watchdog (ری‌استارت خودکار روی قطعی)
 
@@ -119,14 +122,35 @@ sudo abtunnel ipsec server --peer <A_IP>
 sudo abtunnel ipsec client --peer <B_IP> --psk "<PSK_FROM_B>"
 ```
 
-**gre یا ipip (روی IPsec):**
+**gre / ipip (IPv4) — خالی یا رمزنگاری‌شده:**
 ```bash
-# روی B  (یه PSK چاپ می‌کنه)
-sudo abtunnel gre server --peer <A_IP> --psk "<یه PSK یا خالی تا تولید شه>"
-# روی A
-sudo abtunnel gre client --peer <B_IP> --psk "<PSK_FROM_B>"
-# تست:  ping 10.20.0.1   (ipip -> 10.40.0.1)
+# خالی (بدون رمز): روی B سپس A — بدون --psk
+sudo abtunnel gre server --peer <A_IP>
+sudo abtunnel gre client --peer <B_IP>
+# رمزنگاری‌شده: یه PSK مشترک روی هر دو طرف بده
+sudo abtunnel gre server --peer <A_IP> --psk "mysecret"
+sudo abtunnel gre client --peer <B_IP> --psk "mysecret"
+# تست:  ping 10.20.0.1    (ipip -> 10.40.0.1)
 ```
+
+**پروتکل‌های IPv6:**
+```bash
+# sit (IPv6 روی endpoint IPv4)
+sudo abtunnel sit server --peer <A_IPv4>
+sudo abtunnel sit client --peer <B_IPv4>
+# تست:  ping -6 fd60::1
+
+# gre6 (GRE روی endpoint IPv6)
+sudo abtunnel gre6 server --peer <A_IPv6>
+sudo abtunnel gre6 client --peer <B_IPv6>
+# تست:  ping -6 fd20::1
+
+# ip6ip6 (IPv6-in-IPv6)
+sudo abtunnel ip6ip6 server --peer <A_IPv6>
+sudo abtunnel ip6ip6 client --peer <B_IPv6>
+# تست:  ping -6 fd40::1
+```
+> برای رمزنگاری هر کدوم، `--psk "مقدار مشترک"` رو به هر دو طرف اضافه کن.
 
 **openvpn — point-to-point:**
 ```bash

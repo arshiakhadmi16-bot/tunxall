@@ -6,10 +6,14 @@
 #   stunnel  — forward a TCP service over real TLS (cert-pinned).
 #   ssh      — persistent port-forward over SSH (autossh + systemd).
 #   ipsec    — host-to-host encrypted link via strongSwan (PSK, transport mode).
-#   gre      — GRE point-to-point interface, encrypted by IPsec (give --psk).
-#   ipip     — IPIP point-to-point interface, encrypted by IPsec (give --psk).
+#   gre      — GRE point-to-point interface over IPv4 (inner IPv4).
+#   ipip     — IPIP point-to-point interface over IPv4 (inner IPv4).
+#   sit      — 6in4: IPv6 over an IPv4 endpoint.
+#   gre6     — GRE over an IPv6 endpoint (inner IPv6).
+#   ip6ip6   — IPv6-in-IPv6.
 #   openvpn  — point-to-point OpenVPN tunnel (static key, AES-256).
 #   (WireGuard lives in wg-tunnel.sh.)
+# For gre/ipip/sit/gre6/ip6ip6: add --psk to encrypt with IPsec, or omit for plain.
 #
 # Every tunnel runs under systemd with aggressive auto-restart, and an optional
 # health watchdog restarts it if the link stops passing traffic.
@@ -59,7 +63,8 @@ parse_args() {
   done
 }
 
-local_ip_to() { ip -4 route get "$1" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}'; }
+ip_family() { case "$1" in *:*) echo 6;; *) echo 4;; esac; }
+local_ip_to() { local f; f=$(ip_family "$1"); ip -"$f" route get "$1" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}'; }
 
 mkunit() { # name execstart...
   local name="$1"; shift
@@ -214,39 +219,54 @@ EOF
   log "IPsec transport link configured between $myip and $PEER. Check: sudo ipsec status"
 }
 
-# -------------------------------------------------------------- gre / ipip
-ip_tunnel_setup() { # mode(gre|ipip) role(server|client)
-  local mode="$1" role="$2"; need_root; apt_install iproute2
-  [[ -n $PEER ]] || die "need --peer <other server's public IP>"
-  local myip net ifn myaddr peeraddr
-  myip=$(local_ip_to "$PEER"); [[ -n $myip ]] || die "cannot find local IP toward $PEER"
-  if [[ $mode == gre ]]; then ifn=gre1; net=10.20.0; else ifn=ipip1; net=10.40.0; fi
-  if [[ $role == server ]]; then myaddr=$net.1; peeraddr=$net.2; else myaddr=$net.2; peeraddr=$net.1; fi
+# ----------------------------------------- gre / ipip / sit / gre6 / ip6ip6
+# Point-to-point interface tunnels. Endpoints may be IPv4 (gre/ipip/sit) or
+# IPv6 (gre6/ip6ip6); inner address is IPv4 (gre/ipip) or IPv6 (sit/gre6/ip6ip6).
+# Encrypted with IPsec when --psk is given, otherwise plain (unencrypted).
+iface_tunnel_setup() { # kind role
+  local kind="$1" role="$2"; need_root; apt_install iproute2
+  [[ -n $PEER ]] || die "need --peer <other server's endpoint IP>"
+  local fam myip ifn linkargs mod inner mtu=1400 myaddr peeraddr NET="" NET6=""
+  fam=$(ip_family "$PEER"); myip=$(local_ip_to "$PEER"); [[ -n $myip ]] || die "cannot find local IP toward $PEER"
+  case "$kind" in
+    gre)    ifn=gre1;  linkargs="gre";                mod=ip_gre;     inner=4; NET=10.20.0;;
+    ipip)   ifn=ipip1; linkargs="ipip";               mod=ipip;       inner=4; NET=10.40.0;;
+    sit)    ifn=sit1;  linkargs="sit";                 mod=sit;        inner=6; NET6=fd60::;;
+    gre6)   ifn=gre6;  linkargs="ip6gre";              mod=ip6_gre;    inner=6; NET6=fd20::;;
+    ip6ip6) ifn=ip6t1; linkargs="ip6tnl mode ip6ip6";  mod=ip6_tunnel; inner=6; NET6=fd40::;;
+    *) die "unknown tunnel kind: $kind";;
+  esac
+  if [[ $inner == 4 ]]; then
+    if [[ $role == server ]]; then myaddr="$NET.1/30"; peeraddr="$NET.2"; else myaddr="$NET.2/30"; peeraddr="$NET.1"; fi
+  else
+    if [[ $role == server ]]; then myaddr="${NET6}1/126"; peeraddr="${NET6}2"; else myaddr="${NET6}2/126"; peeraddr="${NET6}1"; fi
+  fi
 
   if [[ -n $PSK ]]; then
-    log "Encrypting the $mode link with IPsec first..."
+    log "Encrypting the $kind link with IPsec first..."
     ipsec_setup "$role"
   else
-    warn "No --psk given: the $mode tunnel will be UNENCRYPTED. Add --psk to protect it with IPsec."
+    warn "No --psk: the $kind tunnel is UNENCRYPTED (plain). Add --psk to protect it with IPsec."
   fi
 
   cat > $DIR/$ifn-up.sh <<EOF
 #!/usr/bin/env bash
+modprobe $mod 2>/dev/null || true
 ip link del $ifn 2>/dev/null || true
-ip tunnel add $ifn mode $mode local $myip remote $PEER ttl 255
-ip addr add $myaddr/30 dev $ifn
-ip link set $ifn mtu 1400 up
+ip link add $ifn type $linkargs local $myip remote $PEER
+ip addr add $myaddr dev $ifn
+ip link set $ifn mtu $mtu up
 EOF
   cat > $DIR/$ifn-down.sh <<EOF
 #!/usr/bin/env bash
 ip link set $ifn down 2>/dev/null || true
-ip tunnel del $ifn 2>/dev/null || true
+ip link del $ifn 2>/dev/null || true
 EOF
   mkdir -p $DIR; chmod +x $DIR/$ifn-up.sh $DIR/$ifn-down.sh
-  mkoneshot "abtunnel-$mode" "$DIR/$ifn-up.sh" "$DIR/$ifn-down.sh"
-  log "$mode tunnel up: this side $myaddr <-> peer $peeraddr (iface $ifn)"
-  log "Test:  ping -c3 $peeraddr"
-  log "Health watchdog:  sudo bash abtunnel.sh health --unit abtunnel-$mode --watch-ip $peeraddr"
+  mkoneshot "abtunnel-$kind" "$DIR/$ifn-up.sh" "$DIR/$ifn-down.sh"
+  log "$kind tunnel up: this side ${myaddr%/*} <-> peer $peeraddr (iface $ifn, endpoints over IPv$fam)"
+  log "Test:  ping$([[ $inner == 6 ]] && echo ' -6') -c3 $peeraddr"
+  log "Watchdog:  sudo bash abtunnel.sh health --unit abtunnel-$kind --watch-ip $peeraddr"
 }
 
 # ----------------------------------------------------------------- openvpn
@@ -352,7 +372,7 @@ cmd_status() {
   echo "== abtunnel units =="; systemctl --no-pager --type=service 2>/dev/null | grep -E 'abtunnel|strongswan|ipsec|openvpn' || echo "  (none)"
   echo "== watchdog =="; systemctl --no-pager list-timers abtunnel-health.timer 2>/dev/null | head -2 || true
   echo "== ipsec =="; ipsec status 2>/dev/null || echo "  (strongSwan not active)"
-  echo "== tunnel interfaces =="; ip -brief addr show 2>/dev/null | grep -E 'gre1|ipip1|tun|wg0' || echo "  (none)"
+  echo "== tunnel interfaces =="; ip -brief addr show 2>/dev/null | grep -E 'gre1|ipip1|sit1|gre6|ip6t1|tun|wg0' || echo "  (none)"
 }
 
 cmd_down() {
@@ -362,8 +382,11 @@ cmd_down() {
     openvpn) systemctl disable --now abtunnel-openvpn.service 2>/dev/null || true;;
     gre)     systemctl disable --now abtunnel-gre.service 2>/dev/null || true;;
     ipip)    systemctl disable --now abtunnel-ipip.service 2>/dev/null || true;;
+    sit)     systemctl disable --now abtunnel-sit.service 2>/dev/null || true;;
+    gre6)    systemctl disable --now abtunnel-gre6.service 2>/dev/null || true;;
+    ip6ip6)  systemctl disable --now abtunnel-ip6ip6.service 2>/dev/null || true;;
     ipsec)   ipsec stop 2>/dev/null || systemctl stop strongswan-starter 2>/dev/null || systemctl stop strongswan 2>/dev/null || true;;
-    *) die "Usage: down <stunnel|ssh|ipsec|gre|ipip|openvpn>";;
+    *) die "Usage: down <stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn>";;
   esac
   log "stopped: ${1:-}"
 }
@@ -376,8 +399,12 @@ menu() {
   echo "=============================================="
   echo "Role:  1) server (public IP, receives)   2) client (connects out)"
   read -rp "Role [1-2]: " r
-  echo "Type:  1) stunnel (TLS)   2) ssh   3) ipsec   4) gre+ipsec   5) ipip+ipsec   6) openvpn"
-  read -rp "Type [1-6]: " t
+  echo "Type:"
+  echo "  1) stunnel (TLS)      2) ssh            3) ipsec          6) openvpn"
+  echo "  4) gre  5) ipip  7) sit (6in4)  8) gre6 (GRE/IPv6)  9) ip6ip6"
+  echo "     (for 4/5/7/8/9: enter a shared PSK to encrypt with IPsec, or leave blank for plain)"
+  read -rp "Type [1-9]: " t
+  local kmap_s="" kmap_c=""
   case "$r-$t" in
     1-1) read -rp "Public TLS port [443]: " ACCEPT_PORT; ACCEPT_PORT=${ACCEPT_PORT:-443}; read -rp "Local service port to expose: " SERVICE_PORT; stunnel_server;;
     2-1) read -rp "B public IP: " PEER; read -rp "Public TLS port [443]: " ACCEPT_PORT; ACCEPT_PORT=${ACCEPT_PORT:-443}; read -rp "Local port on A: " LOCAL_PORT; read -rp "server-cert.pem path: " CERT; stunnel_client;;
@@ -385,14 +412,23 @@ menu() {
     2-2) read -rp "SSH port on B [22]: " SSH_PORT; SSH_PORT=${SSH_PORT:-22}; read -rp "B public IP: " PEER; read -rp "Local port on A: " LOCAL_PORT; read -rp "Remote host [127.0.0.1]: " THOST; THOST=${THOST:-127.0.0.1}; read -rp "Remote port: " RPORT; ssh_client;;
     1-3) read -rp "A public IP: " PEER; ipsec_setup server;;
     2-3) read -rp "B public IP: " PEER; read -rp "PSK from B: " PSK; ipsec_setup client;;
-    1-4) read -rp "A public IP: " PEER; ip_tunnel_setup gre server;;
-    2-4) read -rp "B public IP: " PEER; read -rp "PSK from B: " PSK; ip_tunnel_setup gre client;;
-    1-5) read -rp "A public IP: " PEER; ip_tunnel_setup ipip server;;
-    2-5) read -rp "B public IP: " PEER; read -rp "PSK from B: " PSK; ip_tunnel_setup ipip client;;
+    1-4|1-5|1-7|1-8|1-9) kmap_s=1;;
+    2-4|2-5|2-7|2-8|2-9) kmap_c=1;;
     1-6) read -rp "OpenVPN udp port [1194]: " OVPN_PORT; OVPN_PORT=${OVPN_PORT:-1194}; openvpn_server;;
     2-6) read -rp "B public IP: " PEER; read -rp "OpenVPN udp port [1194]: " OVPN_PORT; OVPN_PORT=${OVPN_PORT:-1194}; read -rp "ovpn.key path: " CERT; openvpn_client;;
     *) die "invalid selection";;
   esac
+  if [[ -n $kmap_s$kmap_c ]]; then
+    local kind
+    case "$t" in 4) kind=gre;; 5) kind=ipip;; 7) kind=sit;; 8) kind=gre6;; 9) kind=ip6ip6;; esac
+    if [[ -n $kmap_s ]]; then
+      read -rp "Other server (peer) endpoint IP: " PEER
+      read -rp "Shared PSK (blank = unencrypted/plain): " PSK; iface_tunnel_setup "$kind" server
+    else
+      read -rp "Other server (peer) endpoint IP: " PEER
+      read -rp "Shared PSK (same value as the other side; blank = plain): " PSK; iface_tunnel_setup "$kind" client
+    fi
+  fi
 }
 
 main() {
@@ -405,10 +441,13 @@ main() {
     stunnel) local role="${1:-}"; shift || true; parse_args "$@"; [[ $role == server ]] && stunnel_server || stunnel_client;;
     ssh)     local role="${1:-}"; shift || true; parse_args "$@"; [[ $role == server ]] && ssh_server || ssh_client;;
     ipsec)   local role="${1:-}"; shift || true; parse_args "$@"; ipsec_setup "$role";;
-    gre)     local role="${1:-}"; shift || true; parse_args "$@"; ip_tunnel_setup gre "$role";;
-    ipip)    local role="${1:-}"; shift || true; parse_args "$@"; ip_tunnel_setup ipip "$role";;
+    gre)     local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup gre "$role";;
+    ipip)    local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup ipip "$role";;
+    sit)     local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup sit "$role";;
+    gre6)    local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup gre6 "$role";;
+    ip6ip6)  local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup ip6ip6 "$role";;
     openvpn) local role="${1:-}"; shift || true; parse_args "$@"; [[ $role == server ]] && openvpn_server || openvpn_client;;
-    *) echo "Usage: $0 {menu|stunnel|ssh|ipsec|gre|ipip|openvpn|health|status|down} ..."; echo "Easiest:  sudo bash $0 menu"; exit 1;;
+    *) echo "Usage: $0 {menu|stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn|health|status|down} ..."; echo "Easiest:  sudo bash $0 menu"; exit 1;;
   esac
 }
 main "$@"
