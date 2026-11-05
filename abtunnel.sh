@@ -28,6 +28,7 @@ DIR=/etc/abtunnel
 PEER=""; ACCEPT_PORT=443; SERVICE_PORT=""; LOCAL_PORT=""; SSH_PORT=22
 THOST=127.0.0.1; RPORT=""; PSK=""; PUBKEY=""; CERT=""; OVPN_PORT=1194
 WATCH_IP=""; WATCH_PORT=""; UNIT=""
+PROTO=tcp; IN_PORT=""; TO=""; TO_PORT=""
 
 c_g="\e[32m"; c_r="\e[31m"; c_y="\e[33m"; c_0="\e[0m"
 log()  { echo -e "${c_g}[+]${c_0} $*"; }
@@ -58,6 +59,10 @@ parse_args() {
       --watch-ip)     WATCH_IP="$2"; shift 2;;
       --watch-port)   WATCH_PORT="$2"; shift 2;;
       --unit)         UNIT="$2"; shift 2;;
+      --proto)        PROTO="$2"; shift 2;;
+      --in-port)      IN_PORT="$2"; shift 2;;
+      --to)           TO="$2"; shift 2;;
+      --to-port)      TO_PORT="$2"; shift 2;;
       *) die "Unknown flag: $1";;
     esac
   done
@@ -112,6 +117,15 @@ EOF
   systemctl daemon-reload
   systemctl enable "$name.service" >/dev/null 2>&1 || true
   systemctl restart "$name.service"
+}
+
+enable_forwarding() {
+  cat > /etc/sysctl.d/99-abtunnel-fwd.conf <<'EOF'
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+EOF
+  sysctl -q --system >/dev/null 2>&1 || true
+  log "Kernel IP forwarding enabled (IPv4 + IPv6)."
 }
 
 stunnel_bin() { command -v stunnel4 || command -v stunnel || die "stunnel not found"; }
@@ -264,7 +278,9 @@ ip link del $ifn 2>/dev/null || true
 EOF
   mkdir -p $DIR; chmod +x $DIR/$ifn-up.sh $DIR/$ifn-down.sh
   mkoneshot "abtunnel-$kind" "$DIR/$ifn-up.sh" "$DIR/$ifn-down.sh"
+  enable_forwarding
   log "$kind tunnel up: this side ${myaddr%/*} <-> peer $peeraddr (iface $ifn, endpoints over IPv$fam)"
+  log "Forward a service into the tunnel:  sudo bash abtunnel.sh forward --proto tcp --in-port <PORT> --to $peeraddr --to-port <PORT>"
   log "Test:  ping$([[ $inner == 6 ]] && echo ' -6') -c3 $peeraddr"
   log "Watchdog:  sudo bash abtunnel.sh health --unit abtunnel-$kind --watch-ip $peeraddr"
 }
@@ -286,6 +302,7 @@ persist-key
 persist-tun
 EOF
   mkunit abtunnel-openvpn "$(command -v openvpn) --config $DIR/ovpn.conf"
+  enable_forwarding
   log "OpenVPN server up on udp/$OVPN_PORT, private IP 10.30.0.1"
   echo -e "${c_y}Copy this key to A as /etc/abtunnel/ovpn.key:${c_0}"
   echo "----8<----"; cat $DIR/ovpn.key; echo "----8<----"
@@ -310,6 +327,7 @@ persist-key
 persist-tun
 EOF
   mkunit abtunnel-openvpn "$(command -v openvpn) --config $DIR/ovpn.conf"
+  enable_forwarding
   log "OpenVPN client up, private IP 10.30.0.2 (peer 10.30.0.1)"
   log "Test:  ping -c3 10.30.0.1"
   log "Health watchdog:  sudo bash abtunnel.sh health --unit abtunnel-openvpn --watch-ip 10.30.0.1"
@@ -367,12 +385,67 @@ EOF
   log "Watchdog active: every 30s it checks $target ($mode) and restarts $UNIT if the link is down."
 }
 
+# ----------------------------------------------------- port forwarding
+# DNAT a port on THIS server into the tunnel toward the peer's tunnel IP.
+# Example: expose a DB that runs on the peer, reachable on this server's :3306.
+cmd_forward() {
+  need_root; apt_install iptables
+  [[ -n $IN_PORT ]] || die "need --in-port <port to accept on this server>"
+  [[ -n $TO ]] || die "need --to <peer tunnel IP>"
+  [[ -n $TO_PORT ]] || die "need --to-port <service port on the peer>"
+  case "$PROTO" in tcp|udp) :;; *) die "--proto must be tcp or udp";; esac
+  mkdir -p $DIR
+  local fam; fam=$(ip_family "$TO")
+  cat > "$DIR/forward-$PROTO-$IN_PORT.rule" <<EOF
+PROTO=$PROTO
+IN_PORT=$IN_PORT
+TO=$TO
+TO_PORT=$TO_PORT
+FAM=$fam
+EOF
+  cat > $DIR/forward-apply.sh <<'EOF'
+#!/usr/bin/env bash
+sysctl -q -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+sysctl -q -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+for f in /etc/abtunnel/forward-*.rule; do
+  [[ -e $f ]] || continue
+  PROTO=; IN_PORT=; TO=; TO_PORT=; FAM=; . "$f"
+  if [[ $FAM == 6 ]]; then IPT=ip6tables; DEST="[$TO]:$TO_PORT"; else IPT=iptables; DEST="$TO:$TO_PORT"; fi
+  $IPT -t nat -C PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$DEST" 2>/dev/null \
+    || $IPT -t nat -A PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$DEST"
+  $IPT -t nat -C POSTROUTING -p "$PROTO" -d "$TO" --dport "$TO_PORT" -j MASQUERADE 2>/dev/null \
+    || $IPT -t nat -A POSTROUTING -p "$PROTO" -d "$TO" --dport "$TO_PORT" -j MASQUERADE
+  $IPT -C FORWARD -p "$PROTO" -d "$TO" --dport "$TO_PORT" -j ACCEPT 2>/dev/null \
+    || $IPT -A FORWARD -p "$PROTO" -d "$TO" --dport "$TO_PORT" -j ACCEPT
+done
+EOF
+  chmod +x $DIR/forward-apply.sh
+  cat > /etc/systemd/system/abtunnel-forward.service <<EOF
+[Unit]
+Description=abtunnel port forwarding
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$DIR/forward-apply.sh
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now abtunnel-forward.service
+  systemctl restart abtunnel-forward.service
+  log "Forwarding active: ${PROTO}/${IN_PORT} on this server -> tunnel -> ${TO}:${TO_PORT}"
+  log "Persisted; re-applied on boot. Remove with:  sudo bash abtunnel.sh down forward"
+}
+
 # -------------------------------------------------------------------- misc
 cmd_status() {
   echo "== abtunnel units =="; systemctl --no-pager --type=service 2>/dev/null | grep -E 'abtunnel|strongswan|ipsec|openvpn' || echo "  (none)"
   echo "== watchdog =="; systemctl --no-pager list-timers abtunnel-health.timer 2>/dev/null | head -2 || true
   echo "== ipsec =="; ipsec status 2>/dev/null || echo "  (strongSwan not active)"
   echo "== tunnel interfaces =="; ip -brief addr show 2>/dev/null | grep -E 'gre1|ipip1|sit1|gre6|ip6t1|tun|wg0' || echo "  (none)"
+  echo "== port forwards =="; ls $DIR/forward-*.rule >/dev/null 2>&1 && grep -H '' $DIR/forward-*.rule 2>/dev/null | sed 's/^/  /' || echo "  (none)"
 }
 
 cmd_down() {
@@ -386,7 +459,18 @@ cmd_down() {
     gre6)    systemctl disable --now abtunnel-gre6.service 2>/dev/null || true;;
     ip6ip6)  systemctl disable --now abtunnel-ip6ip6.service 2>/dev/null || true;;
     ipsec)   ipsec stop 2>/dev/null || systemctl stop strongswan-starter 2>/dev/null || systemctl stop strongswan 2>/dev/null || true;;
-    *) die "Usage: down <stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn>";;
+    forward)
+      for f in $DIR/forward-*.rule; do
+        [[ -e $f ]] || continue
+        PROTO=; IN_PORT=; TO=; TO_PORT=; FAM=; . "$f"
+        if [[ $FAM == 6 ]]; then IPT=ip6tables; DEST="[$TO]:$TO_PORT"; else IPT=iptables; DEST="$TO:$TO_PORT"; fi
+        $IPT -t nat -D PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$DEST" 2>/dev/null || true
+        $IPT -t nat -D POSTROUTING -p "$PROTO" -d "$TO" --dport "$TO_PORT" -j MASQUERADE 2>/dev/null || true
+        $IPT -D FORWARD -p "$PROTO" -d "$TO" --dport "$TO_PORT" -j ACCEPT 2>/dev/null || true
+        rm -f "$f"
+      done
+      systemctl disable --now abtunnel-forward.service 2>/dev/null || true;;
+    *) die "Usage: down <stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn|forward>";;
   esac
   log "stopped: ${1:-}"
 }
@@ -438,6 +522,7 @@ main() {
     status) cmd_status;;
     down) cmd_down "${1:-}";;
     health) parse_args "$@"; health_install;;
+    forward) parse_args "$@"; cmd_forward;;
     stunnel) local role="${1:-}"; shift || true; parse_args "$@"; [[ $role == server ]] && stunnel_server || stunnel_client;;
     ssh)     local role="${1:-}"; shift || true; parse_args "$@"; [[ $role == server ]] && ssh_server || ssh_client;;
     ipsec)   local role="${1:-}"; shift || true; parse_args "$@"; ipsec_setup "$role";;
@@ -447,7 +532,7 @@ main() {
     gre6)    local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup gre6 "$role";;
     ip6ip6)  local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup ip6ip6 "$role";;
     openvpn) local role="${1:-}"; shift || true; parse_args "$@"; [[ $role == server ]] && openvpn_server || openvpn_client;;
-    *) echo "Usage: $0 {menu|stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn|health|status|down} ..."; echo "Easiest:  sudo bash $0 menu"; exit 1;;
+    *) echo "Usage: $0 {menu|stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn|forward|health|status|down} ..."; echo "Easiest:  sudo bash $0 menu"; exit 1;;
   esac
 }
 main "$@"
