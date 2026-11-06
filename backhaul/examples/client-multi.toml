@@ -1,0 +1,22 @@
+[client]
+# لیست سرورها برای انتخاب خودکار پایدارترین
+remote_addrs = [
+  "1.2.3.4:3080",
+  "5.6.7.8:3080",
+]
+
+transport = "tcp"
+token = "my_secure_token_change_me"
+connection_pool = 8
+aggressive_pool = false
+keepalive_period = 75
+nodelay = false
+retry_interval = 3
+dial_timeout = 10
+log_level = "info"
+
+# تنظیمات تست پایداری و انتخاب خودکار
+health_check_interval = 30   # هر ۳۰ ثانیه تست کن
+health_check_timeout  = 3    # تایم‌اوت هر تست (ثانیه)
+min_success_rate      = 70   # حداقل درصد موفقیت برای در نظر گرفتن سرور
+switch_threshold_ms   = 50   # فقط وقتی سوییچ کن که RTT حداقل ۵۰ms بهتر باشه

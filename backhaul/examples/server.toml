@@ -1,0 +1,22 @@
+[server]
+bind_addr = "0.0.0.0:3080"
+transport = "tcp"                 # tcp | tcpmux | ws | wss | grpc | grpcs
+token = "my_secure_token_change_me"
+keepalive_period = 75
+nodelay = false
+channel_size = 2048
+heartbeat = 40
+mux_con = 8
+mux_version = 1
+mux_framesize = 32768
+mux_recievebuffer = 4194304
+mux_streambuffer = 65536
+log_level = "info"
+# tls_cert = "/path/to/server.crt"  # required for wss / grpcs
+# tls_key  = "/path/to/server.key"
+
+ports = [
+  "443",
+  "8080=80",
+  "10000-10010",
+]

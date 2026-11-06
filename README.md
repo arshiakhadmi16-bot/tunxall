@@ -16,6 +16,28 @@ curl -fsSL https://raw.githubusercontent.com/arshiakhadmi16-bot/tunxall/main/ins
 
 This installs three global commands: `netcheck`, `abtunnel`, `wg-tunnel`.
 
+### ساده‌ترین راه (منوی جدید)
+
+بعد از نصب فقط بزن:
+
+```bash
+sudo abtunnel
+```
+
+منو این‌طور پیش می‌رود (برای افراد غیر فنی):
+
+1. **نقش این سرور** → سرور یا کلاینت  
+2. **IP سرور مقابل** را وارد کن  
+3. **خودکار** یا **دستی** را انتخاب کن  
+
+**حالت خودکار:**
+- سمت سرور: چند تانل را آماده می‌کند (Backhaul → OpenVPN → GRE → IPIP)
+- سمت کلاینت: به ترتیب امتحان می‌کند؛ اگر وصل نشد **۳ دقیقه** صبر و تانل بعدی را تست می‌کند تا یکی وصل شود
+
+**حالت دستی:** خودت پروتکل را انتخاب می‌کنی.
+
+---
+
 ### ساده‌ترین راه (منوی راهنما)
 
 بعد از نصب، منو **خودکار باز می‌شه** (هر وقت هم خواستی: `sudo abtunnel`).
@@ -90,6 +112,11 @@ sudo abtunnel down <stunnel|ssh|ipsec>
 - **ip6ip6:** IPv6-in-IPv6 (IP داخلی `fd40::x`).
 - **openvpn:** تانل point-to-point با static key و AES-256 روی UDP.
 - **WireGuard:** توی `wg-tunnel` جداگانه.
+- **backhaul:** reverse tunnel با transportهای `tcp` / `tcpmux` / `ws` / `wss` / **`grpc`** / **`grpcs`**.
+  - `grpc` = gRPC روی HTTP/2 بدون TLS (h2c)، `grpcs` = gRPC روی TLS (گواهی self-signed خودکار ساخته می‌شه).
+  - همه‌ی اتصال‌ها (کنترل + دیتا) به‌صورت streamهای جدا روی **یک** اتصال HTTP/2 می‌رن.
+  - مثال: `sudo abtunnel backhaul server --transport grpc --accept-port 3080 --ports "443,8080"`
+    و روی کلاینت: `sudo abtunnel backhaul client --peer <SERVER_IP>:3080 --psk <TOKEN> --transport grpc`
 
 > نکته‌ی مهم: `gre`/`ipip`/`sit`/`gre6`/`ip6ip6` بدون `--psk` **رمزنگاری نمی‌شن** (plain). با دادن یه `--psk` مشترک (یک مقدار روی هر دو طرف) با IPsec رمز می‌شن.
 
@@ -204,3 +231,58 @@ sudo wg-tunnel client --endpoint <B_IP> --port 51820 --pubkey <B_PUBKEY>
 ## نکته‌ی فنی
 
 این تانل‌ها روی یه پورتی که بین دو سرور **باز** باشه برقرار می‌شن. با `netcheck` اول ببین کدوم پورت بازه، بعد تانل رو روی همون پورت بالا بیار.
+
+---
+
+## 🚀 Backhaul Reverse Tunnel (جدید)
+
+یک تانل reverse با عملکرد بالا که به tunxall اضافه شده:
+
+- پشتیبانی از `tcp` / `tcpmux` / `ws` / `wss`
+- **انتخاب خودکار پایدارترین سرور** بین چند سرور
+- Connection Pool + Heartbeat + Auto Restart
+- نصب و مدیریت از همان منوی `abtunnel`
+
+### استفاده از منو
+
+```bash
+sudo abtunnel
+# 1) Set up a tunnel (guided)
+# → SERVER یا CLIENT
+# → IPv4
+# → 9) backhaul
+```
+
+### حالت چندسروره (Auto-Select)
+
+روی **CLIENT** می‌توانی چند آدرس بدهی:
+
+```
+Server address(es): 1.2.3.4:3080,5.6.7.8:3080
+Token: <token از سرور>
+```
+
+سیستم هر ۳۰ ثانیه هر دو سرور را تست می‌کند (RTT + Success Rate) و تانل را روی پایدارترین نگه می‌دارد.
+
+### دستور مستقیم
+
+```bash
+# سرور
+sudo abtunnel backhaul server --accept-port 3080 --psk mytoken
+
+# کلاینت تکی
+sudo abtunnel backhaul client --peer 1.2.3.4 --accept-port 3080 --psk mytoken
+
+# کلاینت چندسروره (با متغیر محیطی)
+PEERS="1.2.3.4:3080,5.6.7.8:3080" PSK=mytoken sudo abtunnel backhaul client
+```
+
+### مدیریت
+
+```bash
+sudo abtunnel status
+sudo abtunnel down backhaul
+systemctl status abtunnel-backhaul
+```
+
+کد منبع Backhaul داخل پوشه `backhaul/` قرار دارد و هنگام نصب (در صورت وجود Go) بیلد می‌شود.

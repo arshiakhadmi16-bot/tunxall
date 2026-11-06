@@ -12,6 +12,7 @@
 #   gre6     — GRE over an IPv6 endpoint (inner IPv6).
 #   ip6ip6   — IPv6-in-IPv6.
 #   openvpn  — point-to-point OpenVPN tunnel (static key, AES-256).
+#   backhaul — high-performance reverse tunnel (tcp/tcpmux/ws/wss/grpc/grpcs) with multi-server auto-select.
 #   (WireGuard lives in wg-tunnel.sh.)
 # For gre/ipip/sit/gre6/ip6ip6: add --psk to encrypt with IPsec, or omit for plain.
 #
@@ -23,6 +24,16 @@
 # Watchdog:      sudo bash abtunnel.sh health --unit <unit> --watch-ip <ip>|--watch-port <port>
 # Status/down:   sudo bash abtunnel.sh status | down <type>
 set -euo pipefail
+
+# Load backhaul helper if present
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/backhaul-helper.sh" ]]; then
+  # shellcheck source=/dev/null
+  source "$SCRIPT_DIR/backhaul-helper.sh"
+elif [[ -f /usr/local/lib/tunxall/backhaul-helper.sh ]]; then
+  # shellcheck source=/dev/null
+  source /usr/local/lib/tunxall/backhaul-helper.sh
+fi
 
 DIR=/etc/abtunnel
 PEER=""; ACCEPT_PORT=443; SERVICE_PORT=""; LOCAL_PORT=""; SSH_PORT=22
@@ -63,6 +74,9 @@ parse_args() {
       --in-port)      IN_PORT="$2"; shift 2;;
       --to)           TO="$2"; shift 2;;
       --to-port)      TO_PORT="$2"; shift 2;;
+      --transport)    TRANSPORT="$2"; shift 2;;
+      --ports)        PORTS="$2"; shift 2;;
+      --peers)        PEERS="$2"; shift 2;;
       *) die "Unknown flag: $1";;
     esac
   done
@@ -269,6 +283,7 @@ iface_tunnel_setup() { # kind role
     warn "No --psk: the $kind tunnel is UNENCRYPTED (plain). Add --psk to protect it with IPsec."
   fi
 
+  mkdir -p $DIR && chmod 700 $DIR
   cat > $DIR/$ifn-up.sh <<EOF
 #!/usr/bin/env bash
 modprobe $mod 2>/dev/null || true
@@ -282,7 +297,7 @@ EOF
 ip link set $ifn down 2>/dev/null || true
 ip link del $ifn 2>/dev/null || true
 EOF
-  mkdir -p $DIR; chmod +x $DIR/$ifn-up.sh $DIR/$ifn-down.sh
+  chmod +x $DIR/$ifn-up.sh $DIR/$ifn-down.sh
   mkoneshot "abtunnel-$kind" "$DIR/$ifn-up.sh" "$DIR/$ifn-down.sh"
   enable_forwarding
   log "$kind tunnel up: this side ${myaddr%/*} <-> peer $peeraddr (iface $ifn, endpoints over IPv$fam)"
@@ -458,7 +473,7 @@ cmd_uninstall() {
   cmd_down forward 2>/dev/null || true
   systemctl disable --now abtunnel-stunnel abtunnel-ssh abtunnel-openvpn \
     abtunnel-gre abtunnel-ipip abtunnel-sit abtunnel-gre6 abtunnel-ip6ip6 \
-    abtunnel-forward abtunnel-health.timer abtunnel-health 2>/dev/null || true
+    abtunnel-forward abtunnel-health.timer abtunnel-health abtunnel-backhaul 2>/dev/null || true
   ipsec stop 2>/dev/null || true
   systemctl stop strongswan-starter strongswan 2>/dev/null || true
   wg-quick down wg0 2>/dev/null || true
@@ -468,12 +483,16 @@ cmd_uninstall() {
   rm -rf /etc/abtunnel /opt/tunxall
   rm -f /etc/sysctl.d/99-abtunnel-fwd.conf /etc/wireguard/wg0.conf /etc/ipsec.conf /etc/ipsec.secrets
   rm -f /usr/local/bin/abtunnel /usr/local/bin/netcheck /usr/local/bin/wg-tunnel
+  rm -rf /usr/local/lib/tunxall
   log "Fully removed: all tunnels, services, configs, and commands."
 }
 
 # -------------------------------------------------------------------- misc
 cmd_status() {
-  echo "== abtunnel units =="; systemctl --no-pager --type=service 2>/dev/null | grep -E 'abtunnel|strongswan|ipsec|openvpn' || echo "  (none)"
+  echo "== abtunnel units =="; systemctl --no-pager --type=service 2>/dev/null | grep -E 'abtunnel|strongswan|ipsec|openvpn|backhaul' || echo "  (none)"
+  if command -v backhaul_status &>/dev/null || type backhaul_status &>/dev/null; then
+    echo "== backhaul =="; backhaul_status || true
+  fi
   echo "== watchdog =="; systemctl --no-pager list-timers abtunnel-health.timer 2>/dev/null | head -2 || true
   echo "== ipsec =="; ipsec status 2>/dev/null || echo "  (strongSwan not active)"
   echo "== tunnel interfaces =="; ip -brief addr show 2>/dev/null | grep -E 'gre1|ipip1|sit1|gre6|ip6t1|tun|wg0' || echo "  (none)"
@@ -502,7 +521,8 @@ cmd_down() {
         rm -f "$f"
       done
       systemctl disable --now abtunnel-forward.service 2>/dev/null || true;;
-    *) die "Usage: down <stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn|forward>";;
+    backhaul) type backhaul_down >/dev/null 2>&1 || die "backhaul helper not installed"; backhaul_down;;
+    *) die "Usage: down <stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn|backhaul|forward>";;
   esac
   log "stopped: ${1:-}"
 }
@@ -547,77 +567,397 @@ client_test_ip() { # proto -> tunnel IP to ping (empty = none)
   esac
 }
 
-report_client() { # proto — test reachability and report; returns to menu either way
+report_client() { # proto — test reachability and report
   local proto="$1" t p6=""
-  echo; log "Testing the tunnel..."; sleep 2
+  echo; log "در حال تست تانل..."
+  sleep 2
   case "$proto" in
     stunnel|ssh)
-      if [[ -n $LOCAL_PORT ]] && timeout 3 bash -c "echo >/dev/tcp/127.0.0.1/$LOCAL_PORT" 2>/dev/null; then
-        log "SUCCESS — local port $LOCAL_PORT is open; tunnel is working."
+      if [[ -n ${LOCAL_PORT:-} ]] && timeout 3 bash -c "echo >/dev/tcp/127.0.0.1/$LOCAL_PORT" 2>/dev/null; then
+        log "موفق — پورت محلی $LOCAL_PORT باز است؛ تانل کار می‌کند."
+        return 0
       else
-        warn "Tunnel NOT confirmed (local port ${LOCAL_PORT:-?} not open). Back to the main menu."
+        warn "تانل تأیید نشد (پورت محلی باز نیست)."
+        return 1
       fi
-      return 0;;
+      ;;
+    backhaul)
+      local i since; since=$(date '+%Y-%m-%d %H:%M:%S' -d '-30 sec' 2>/dev/null || echo "-1min")
+      for i in $(seq 1 10); do
+        if journalctl -u abtunnel-backhaul --since "$since" --no-pager 2>/dev/null | grep -q 'control channel established'; then
+          log "موفق — کانال کنترل backhaul به سرور وصل شد."
+          return 0
+        fi
+        sleep 2
+      done
+      warn "تانل backhaul تأیید نشد. لاگ:  journalctl -u abtunnel-backhaul -n 30"
+      return 1
+      ;;
   esac
   t=$(client_test_ip "$proto")
-  [[ -z $t ]] && { log "Configured. (no automatic reachability test for $proto)"; return 0; }
+  [[ -z $t ]] && { log "پیکربندی شد. (تست خودکار برای $proto تعریف نشده)"; return 0; }
   [[ $t == *:* ]] && p6="-6"
   if ping $p6 -c3 -W2 "$t" >/dev/null 2>&1; then
-    log "SUCCESS — tunnel is up (peer $t reachable)."
+    log "موفق — تانل بالا آمد (پیر $t در دسترس است)."
+    return 0
   else
-    warn "Tunnel did NOT come up (no reply from $t)."
-    warn "Back to the main menu — run setup again or pick another protocol."
+    warn "تانل بالا نیامد (پاسخی از $t نرسید)."
+    return 1
   fi
 }
 
-wizard_guided() {
-  local role fam p
-  echo; echo "This server is the:"
-  echo "  1) SERVER  — has a public IP; the other side connects TO it"
-  echo "  2) CLIENT  — connects OUT to the server"
-  read -rp "> " role
-  [[ $role == 1 || $role == 2 ]] || { warn "invalid choice"; return 0; }
-  echo; echo "Tunnel endpoints over:"
-  echo "  1) IPv4"
-  echo "  2) IPv6"
-  read -rp "> " fam
+# ---------- helpers for simple auto mode ----------
+wait_minutes() {
+  local mins="${1:-3}"
+  local secs=$((mins * 60))
+  echo -e "${c_y}[!]${c_0} صبر به مدت ${mins} دقیقه قبل از تست تانل بعدی..."
+  local left=$secs
+  while (( left > 0 )); do
+    printf "\r   باقی‌مانده: %02d:%02d " $((left/60)) $((left%60))
+    sleep 1
+    left=$((left-1))
+  done
   echo
-  if [[ $fam == 1 ]]; then
-    echo "Protocol (IPv4):"
-    echo "  1) openvpn    2) wireguard   3) stunnel (TLS)   4) ssh"
-    echo "  5) ipsec      6) gre         7) ipip            8) sit (6in4)"
-    read -rp "> " p
-    case "$p" in 1) p=openvpn;; 2) p=wireguard;; 3) p=stunnel;; 4) p=ssh;; 5) p=ipsec;; 6) p=gre;; 7) p=ipip;; 8) p=sit;; *) warn "invalid choice"; return 0;; esac
-  elif [[ $fam == 2 ]]; then
-    echo "Protocol (IPv6):"
-    echo "  1) gre6       2) ip6ip6"
-    read -rp "> " p
-    case "$p" in 1) p=gre6;; 2) p=ip6ip6;; *) warn "invalid choice"; return 0;; esac
+}
+
+# Try bring a tunnel down quietly before trying next
+quiet_down() {
+  local kind="$1"
+  cmd_down "$kind" >/dev/null 2>&1 || true
+  systemctl disable --now "abtunnel-${kind}" 2>/dev/null || true
+}
+
+# ---------- AUTOMATIC mode ----------
+# Server side: prepare protocols in order so client can try them
+auto_server() {
+  local peer_ip="$1"
+  PEER="$peer_ip"
+
+  echo
+  log "حالت خودکار — سمت سرور"
+  log "IP طرف مقابل: $peer_ip"
+  echo
+  echo "تانل‌ها به ترتیب آماده می‌شوند. روی سرور دیگر حالت خودکار (کلاینت) را بزنید."
+  echo
+
+  # 1) Backhaul (easiest token-based reverse tunnel)
+  echo "────────────────────────────────────"
+  log "۱/۴ آماده‌سازی Backhaul..."
+  ACCEPT_PORT=3080
+  PSK="$(openssl rand -hex 12 2>/dev/null || echo "tunxall$(date +%s)")"
+  TRANSPORT=tcp
+  PORTS="443,8080"
+  if ( backhaul_server ); then
+    log "Backhaul آماده است (پورت 3080)."
   else
-    warn "invalid choice"; return 0
+    warn "Backhaul آماده نشد — ادامه می‌دهیم."
   fi
 
-  if [[ $role == 1 ]]; then   # ---- SERVER side ----
-    case "$p" in
-      openvpn)   read -rp "UDP port [51820]: " OVPN_PORT; OVPN_PORT=${OVPN_PORT:-51820}; ( openvpn_server ) || warn "setup failed — back to menu";;
-      wireguard) read -rp "UDP port [51820]: " WGP; WGP=${WGP:-51820}; ( wg-tunnel server --port "$WGP" ) || warn "setup failed — back to menu";;
-      stunnel)   read -rp "Public TLS port [443]: " ACCEPT_PORT; ACCEPT_PORT=${ACCEPT_PORT:-443}; read -rp "Local service port to expose: " SERVICE_PORT; ( stunnel_server ) || warn "setup failed — back to menu";;
-      ssh)       read -rp "Client public key (blank to add later): " PUBKEY; ( ssh_server ) || warn "setup failed — back to menu";;
-      ipsec)     read -rp "Client public IP: " PEER; ( ipsec_setup server ) || warn "setup failed — back to menu";;
-      gre|ipip|sit|gre6|ip6ip6) read -rp "Client endpoint IP: " PEER; read -rp "Shared PSK (blank = unencrypted): " PSK; ( iface_tunnel_setup "$p" server ) || warn "setup failed — back to menu";;
-    esac
-  else                        # ---- CLIENT side ----
-    case "$p" in
-      openvpn)   echo "Paste the token from the server and press Enter:"; read -r tok; ( cmd_connect "$tok" ) || warn "connect failed — back to menu"; return 0;;
-      wireguard) read -rp "Server public IP: " PEER; read -rp "UDP port [51820]: " WGP; WGP=${WGP:-51820}; read -rp "Server public key: " PUBKEY; ( wg-tunnel client --endpoint "$PEER" --port "$WGP" --pubkey "$PUBKEY" ) || warn "setup failed — back to menu";;
-      stunnel)   read -rp "Server public IP: " PEER; read -rp "Public TLS port [443]: " ACCEPT_PORT; ACCEPT_PORT=${ACCEPT_PORT:-443}; read -rp "Local port on this machine: " LOCAL_PORT; read -rp "server-cert.pem path: " CERT; ( stunnel_client ) || warn "setup failed — back to menu";;
-      ssh)       read -rp "Server public IP: " PEER; read -rp "SSH port [22]: " SSH_PORT; SSH_PORT=${SSH_PORT:-22}; read -rp "Local port on this machine: " LOCAL_PORT; read -rp "Remote host [127.0.0.1]: " THOST; THOST=${THOST:-127.0.0.1}; read -rp "Remote port: " RPORT; ( ssh_client ) || warn "setup failed — back to menu";;
-      ipsec)     read -rp "Server public IP: " PEER; read -rp "PSK from server: " PSK; ( ipsec_setup client ) || warn "setup failed — back to menu";;
-      gre|ipip|sit|gre6|ip6ip6) read -rp "Server endpoint IP: " PEER; read -rp "Shared PSK (same as server; blank = unencrypted): " PSK; ( iface_tunnel_setup "$p" client ) || warn "setup failed — back to menu";;
-    esac
-    report_client "$p"
+  # 2) OpenVPN
+  echo "────────────────────────────────────"
+  log "۲/۴ آماده‌سازی OpenVPN..."
+  OVPN_PORT=51820
+  if ( openvpn_server ); then
+    log "OpenVPN آماده است."
+  else
+    warn "OpenVPN آماده نشد — ادامه می‌دهیم."
   fi
-  return 0
+
+  # 3) GRE
+  echo "────────────────────────────────────"
+  log "۳/۴ آماده‌سازی GRE..."
+  PSK=""
+  if ( iface_tunnel_setup gre server ); then
+    log "GRE آماده است."
+  else
+    warn "GRE آماده نشد — ادامه می‌دهیم."
+  fi
+
+  # 4) IPIP
+  echo "────────────────────────────────────"
+  log "۴/۴ آماده‌سازی IPIP..."
+  PSK=""
+  if ( iface_tunnel_setup ipip server ); then
+    log "IPIP آماده است."
+  else
+    warn "IPIP آماده نشد."
+  fi
+
+  echo
+  log "سمت سرور آماده است. حالا روی سرور دیگر همین منو را باز کنید و نقش کلاینت + حالت خودکار را بزنید."
+  echo "توکن‌ها / اطلاعات لازم در خروجی بالا چاپ شده‌اند."
+}
+
+# Client side: try each tunnel in order, wait 3 min on failure
+auto_client() {
+  local peer_ip="$1"
+  PEER="$peer_ip"
+
+  echo
+  log "حالت خودکار — سمت کلاینت"
+  log "IP سرور: $peer_ip"
+  echo
+  echo "به ترتیب تانل‌ها را امتحان می‌کنیم."
+  echo "اگر وصل نشد، ۳ دقیقه صبر و بعد تانل بعدی."
+  echo
+
+  local ok=0
+
+  # --- 1) Backhaul ---
+  echo "════════════════════════════════════"
+  log "تست ۱/۴ — Backhaul"
+  echo "اگر روی سرور توکن Backhaul چاپ شده، اینجا Paste کنید."
+  echo "اگر ندارید Enter بزنید تا رد شود."
+  read -rp "توکن Backhaul (یا Enter): " tok
+  if [[ -n $tok ]]; then
+    if ( backhaul_connect_token "$tok" ) && report_client backhaul; then
+      log "اتصال با Backhaul برقرار شد. تمام."
+      return 0
+    fi
+    warn "Backhaul وصل نشد."
+    quiet_down backhaul
+    wait_minutes 3
+  else
+    # try with default port + ask token
+    read -rp "توکن ساده (اگر دارید): " PSK
+    if [[ -n $PSK ]]; then
+      ACCEPT_PORT=3080
+      TRANSPORT=tcp
+      if ( PEER="$peer_ip" PSK="$PSK" TRANSPORT=tcp backhaul_client ) && report_client backhaul; then
+        log "اتصال با Backhaul برقرار شد. تمام."
+        return 0
+      fi
+      warn "Backhaul وصل نشد."
+      quiet_down backhaul
+      wait_minutes 3
+    else
+      warn "توکن نبود — Backhaul رد شد."
+    fi
+  fi
+
+  # --- 2) OpenVPN ---
+  echo "════════════════════════════════════"
+  log "تست ۲/۴ — OpenVPN"
+  echo "توکن OpenVPN سرور را Paste کنید (یا Enter برای رد)."
+  read -rp "توکن OpenVPN: " tok
+  if [[ -n $tok ]]; then
+    if ( cmd_connect "$tok" ) && report_client openvpn; then
+      log "اتصال با OpenVPN برقرار شد. تمام."
+      return 0
+    fi
+    warn "OpenVPN وصل نشد."
+    quiet_down openvpn
+    wait_minutes 3
+  else
+    warn "توکن نبود — OpenVPN رد شد."
+  fi
+
+  # --- 3) GRE ---
+  echo "════════════════════════════════════"
+  log "تست ۳/۴ — GRE"
+  PSK=""
+  if ( iface_tunnel_setup gre client ) && report_client gre; then
+    log "اتصال با GRE برقرار شد. تمام."
+    return 0
+  fi
+  warn "GRE وصل نشد."
+  quiet_down gre
+  wait_minutes 3
+
+  # --- 4) IPIP ---
+  echo "════════════════════════════════════"
+  log "تست ۴/۴ — IPIP"
+  PSK=""
+  if ( iface_tunnel_setup ipip client ) && report_client ipip; then
+    log "اتصال با IPIP برقرار شد. تمام."
+    return 0
+  fi
+  warn "IPIP وصل نشد."
+  quiet_down ipip
+
+  echo
+  warn "هیچ‌کدام از تانل‌های خودکار وصل نشدند."
+  echo "پیشنهاد:"
+  echo "  • فایروال دو طرف را چک کنید (sudo netcheck ...)"
+  echo "  • حالت دستی را امتحان کنید و پروتکل دیگری انتخاب کنید"
+  return 1
+}
+
+# ---------- MANUAL mode (simple) ----------
+manual_setup() {
+  local role="$1" peer_ip="$2"
+  PEER="$peer_ip"
+
+  echo
+  echo "پروتکل را انتخاب کنید:"
+  echo "  1) Backhaul   (پیشنهادی — reverse tunnel)"
+  echo "  2) OpenVPN"
+  echo "  3) WireGuard"
+  echo "  4) GRE"
+  echo "  5) IPIP"
+  echo "  6) SSH"
+  echo "  7) Stunnel (TLS)"
+  echo "  8) IPsec"
+  read -rp "شماره پروتکل: " p
+
+  local proto=""
+  case "$p" in
+    1) proto=backhaul;;
+    2) proto=openvpn;;
+    3) proto=wireguard;;
+    4) proto=gre;;
+    5) proto=ipip;;
+    6) proto=ssh;;
+    7) proto=stunnel;;
+    8) proto=ipsec;;
+    *) warn "انتخاب نامعتبر"; return 0;;
+  esac
+
+  if [[ $role == server ]]; then
+    case "$proto" in
+      backhaul)
+        read -rp "پورت گوش‌دادن [3080]: " ACCEPT_PORT; ACCEPT_PORT=${ACCEPT_PORT:-3080}
+        read -rp "توکن (خالی = ساخت خودکار): " PSK
+        read -rp "نوع حمل (tcp/tcpmux/ws/wss/grpc/grpcs) [tcp]: " TRANSPORT; TRANSPORT=${TRANSPORT:-tcp}
+        PORTS="443,8080"
+        ( backhaul_server ) || warn "ناموفق"
+        ;;
+      openvpn)
+        read -rp "پورت UDP [51820]: " OVPN_PORT; OVPN_PORT=${OVPN_PORT:-51820}
+        ( openvpn_server ) || warn "ناموفق"
+        ;;
+      wireguard)
+        read -rp "پورت UDP [51820]: " WGP; WGP=${WGP:-51820}
+        wg-tunnel server --port "$WGP" || warn "ناموفق"
+        ;;
+      gre|ipip)
+        read -rp "PSK مشترک (خالی = بدون رمز): " PSK
+        ( iface_tunnel_setup "$proto" server ) || warn "ناموفق"
+        ;;
+      ssh)
+        read -rp "کلید عمومی کلاینت (خالی = بعداً): " PUBKEY
+        ( ssh_server ) || warn "ناموفق"
+        ;;
+      stunnel)
+        read -rp "پورت TLS عمومی [443]: " ACCEPT_PORT; ACCEPT_PORT=${ACCEPT_PORT:-443}
+        read -rp "پورت سرویس محلی برای expose: " SERVICE_PORT
+        ( stunnel_server ) || warn "ناموفق"
+        ;;
+      ipsec)
+        ( ipsec_setup server ) || warn "ناموفق"
+        ;;
+    esac
+  else
+    case "$proto" in
+      backhaul)
+        echo "توکن سرور را Paste کنید (یا Enter برای ورود دستی):"
+        read -r tok
+        if [[ -n $tok ]]; then
+          ( backhaul_connect_token "$tok" ) || warn "ناموفق"
+        else
+          read -rp "آدرس سرور (ip یا ip:port): " PEERS
+          read -rp "توکن: " PSK
+          read -rp "نوع حمل (همان سرور: tcp/tcpmux/ws/wss/grpc/grpcs) [tcp]: " TRANSPORT; TRANSPORT=${TRANSPORT:-tcp}
+          ACCEPT_PORT=3080
+          if [[ "$PEERS" != *:* ]]; then PEERS="${PEERS}:3080"; fi
+          ( PEERS="$PEERS" PSK="$PSK" TRANSPORT="$TRANSPORT" backhaul_client ) || warn "ناموفق"
+        fi
+        report_client backhaul || true
+        ;;
+      openvpn)
+        echo "توکن OpenVPN سرور را Paste کنید:"
+        read -r tok
+        ( cmd_connect "$tok" ) || warn "ناموفق"
+        report_client openvpn || true
+        ;;
+      wireguard)
+        read -rp "کلید عمومی سرور: " PUBKEY
+        read -rp "پورت UDP [51820]: " WGP; WGP=${WGP:-51820}
+        wg-tunnel client --endpoint "$peer_ip" --port "$WGP" --pubkey "$PUBKEY" || warn "ناموفق"
+        report_client wireguard || true
+        ;;
+      gre|ipip)
+        read -rp "PSK مشترک (همان سرور؛ خالی = بدون رمز): " PSK
+        ( iface_tunnel_setup "$proto" client ) || warn "ناموفق"
+        report_client "$proto" || true
+        ;;
+      ssh)
+        read -rp "پورت SSH [22]: " SSH_PORT; SSH_PORT=${SSH_PORT:-22}
+        read -rp "پورت محلی روی این ماشین: " LOCAL_PORT
+        read -rp "هاست مقصد داخل سرور [127.0.0.1]: " THOST; THOST=${THOST:-127.0.0.1}
+        read -rp "پورت مقصد داخل سرور: " RPORT
+        ( ssh_client ) || warn "ناموفق"
+        report_client ssh || true
+        ;;
+      stunnel)
+        read -rp "پورت TLS [443]: " ACCEPT_PORT; ACCEPT_PORT=${ACCEPT_PORT:-443}
+        read -rp "پورت محلی روی این ماشین: " LOCAL_PORT
+        read -rp "مسیر server-cert.pem: " CERT
+        ( stunnel_client ) || warn "ناموفق"
+        report_client stunnel || true
+        ;;
+      ipsec)
+        read -rp "PSK از سرور: " PSK
+        ( ipsec_setup client ) || warn "ناموفق"
+        report_client ipsec || true
+        ;;
+    esac
+  fi
+}
+
+# ---------- main simple guided flow ----------
+wizard_guided() {
+  local role mode peer_ip
+
+  clear 2>/dev/null || true
+  echo
+  echo "╔════════════════════════════════════════╗"
+  echo "║     راه‌اندازی ساده تانل (tunxall)      ║"
+  echo "╚════════════════════════════════════════╝"
+  echo
+
+  # Step 1: role
+  echo "۱) نقش این سرور چیست؟"
+  echo "   1) سرور   (IP عمومی دارد؛ طرف مقابل به آن وصل می‌شود)"
+  echo "   2) کلاینت (به سرور وصل می‌شود)"
+  read -rp "انتخاب [1/2]: " role
+  case "$role" in
+    1) role=server;;
+    2) role=client;;
+    *) warn "انتخاب نامعتبر"; return 0;;
+  esac
+
+  # Step 2: peer IP
+  echo
+  echo "۲) IP سرور مقابل را وارد کنید:"
+  read -rp "IP: " peer_ip
+  peer_ip=$(echo "$peer_ip" | xargs)
+  [[ -n $peer_ip ]] || { warn "IP خالی است"; return 0; }
+  PEER="$peer_ip"
+
+  # Step 3: auto or manual
+  echo
+  echo "۳) نحوه راه‌اندازی:"
+  echo "   1) خودکار  — خودش به ترتیب تانل‌ها را امتحان می‌کند"
+  echo "               (اگر وصل نشد ۳ دقیقه صبر و تانل بعدی)"
+  echo "   2) دستی    — خودتان پروتکل را انتخاب می‌کنید"
+  read -rp "انتخاب [1/2]: " mode
+  case "$mode" in
+    1) mode=auto;;
+    2) mode=manual;;
+    *) warn "انتخاب نامعتبر"; return 0;;
+  esac
+
+  echo
+  if [[ $mode == auto ]]; then
+    if [[ $role == server ]]; then
+      auto_server "$peer_ip"
+    else
+      auto_client "$peer_ip"
+    fi
+  else
+    manual_setup "$role" "$peer_ip"
+  fi
 }
 
 # -------------------------------------------------------- main interactive menu
@@ -625,25 +965,39 @@ wizard() {
   need_root
   while true; do
     echo
-    echo "================= tunxall ================="
-    echo "  1) Set up a tunnel (guided)"
-    echo "  2) Show status"
-    echo "  3) Add a port-forward"
-    echo "  4) Enable auto-restart watchdog"
-    echo "  5) Remove a tunnel"
-    echo "  6) Uninstall everything"
-    echo "  0) Exit"
-    echo "==========================================="
-    read -rp "Choose: " c
+    echo "════════════════ tunxall ════════════════"
+    echo "  1) راه‌اندازی تانل (ساده)"
+    echo "  2) وضعیت"
+    echo "  3) افزودن پورت‌فوروارد"
+    echo "  4) نگهبان ری‌استارت خودکار"
+    echo "  5) حذف یک تانل"
+    echo "  6) حذف کامل"
+    echo "  7) منوی پیشرفته (قبلی)"
+    echo "  0) خروج"
+    echo "═════════════════════════════════════════"
+    read -rp "انتخاب: " c
     case "$c" in
       1) wizard_guided || true;;
       2) cmd_status;;
-      3) read -rp "Incoming port on this machine: " IN_PORT; read -rp "Peer tunnel IP [10.30.0.1]: " TO; TO=${TO:-10.30.0.1}; read -rp "Service port on peer: " TO_PORT; read -rp "Protocol tcp/udp [tcp]: " PROTO; PROTO=${PROTO:-tcp}; ( cmd_forward ) || warn "failed";;
-      4) read -rp "Unit [abtunnel-openvpn]: " UNIT; UNIT=${UNIT:-abtunnel-openvpn}; read -rp "Peer tunnel IP to ping [10.30.0.1]: " WATCH_IP; WATCH_IP=${WATCH_IP:-10.30.0.1}; ( health_install ) || warn "failed";;
-      5) read -rp "Which (stunnel/ssh/ipsec/gre/ipip/sit/gre6/ip6ip6/openvpn/forward): " d; ( cmd_down "$d" ) || warn "failed";;
-      6) read -rp "Remove EVERYTHING? type 'yes': " yn; [[ $yn == yes ]] && cmd_uninstall || warn "cancelled";;
+      3) read -rp "پورت ورودی روی این ماشین: " IN_PORT
+         read -rp "IP تانل طرف مقابل [10.30.0.1]: " TO; TO=${TO:-10.30.0.1}
+         read -rp "پورت سرویس روی طرف مقابل: " TO_PORT
+         read -rp "پروتکل tcp/udp [tcp]: " PROTO; PROTO=${PROTO:-tcp}
+         ( cmd_forward ) || warn "ناموفق"
+         ;;
+      4) read -rp "Unit [abtunnel-openvpn]: " UNIT; UNIT=${UNIT:-abtunnel-openvpn}
+         read -rp "IP تانل برای ping [10.30.0.1]: " WATCH_IP; WATCH_IP=${WATCH_IP:-10.30.0.1}
+         ( health_install ) || warn "ناموفق"
+         ;;
+      5) read -rp "کدام (stunnel/ssh/ipsec/gre/ipip/openvpn/backhaul/forward): " d
+         ( cmd_down "$d" ) || warn "ناموفق"
+         ;;
+      6) read -rp "همه چیز حذف شود؟ yes بنویسید: " yn
+         [[ $yn == yes ]] && cmd_uninstall || warn "لغو شد"
+         ;;
+      7) ( menu_advanced ) || true;;
       0) exit 0;;
-      *) warn "invalid choice";;
+      *) warn "انتخاب نامعتبر";;
     esac
   done
 }
@@ -673,7 +1027,7 @@ menu_advanced() {
     2-4|2-5|2-7|2-8|2-9) kmap_c=1;;
     1-6) read -rp "OpenVPN udp port [1194]: " OVPN_PORT; OVPN_PORT=${OVPN_PORT:-1194}; openvpn_server;;
     2-6) read -rp "B public IP: " PEER; read -rp "OpenVPN udp port [1194]: " OVPN_PORT; OVPN_PORT=${OVPN_PORT:-1194}; read -rp "ovpn.key path: " CERT; openvpn_client;;
-    *) die "invalid selection";;
+    *) warn "invalid selection"; return 1;;
   esac
   if [[ -n $kmap_s$kmap_c ]]; then
     local kind
@@ -699,16 +1053,17 @@ main() {
     down) cmd_down "${1:-}";;
     health) parse_args "$@"; health_install;;
     forward) parse_args "$@"; cmd_forward;;
-    stunnel) local role="${1:-}"; shift || true; parse_args "$@"; [[ $role == server ]] && stunnel_server || stunnel_client;;
-    ssh)     local role="${1:-}"; shift || true; parse_args "$@"; [[ $role == server ]] && ssh_server || ssh_client;;
+    stunnel) local role="${1:-}"; shift || true; parse_args "$@"; if [[ $role == server ]]; then stunnel_server; else stunnel_client; fi;;
+    ssh)     local role="${1:-}"; shift || true; parse_args "$@"; if [[ $role == server ]]; then ssh_server; else ssh_client; fi;;
     ipsec)   local role="${1:-}"; shift || true; parse_args "$@"; ipsec_setup "$role";;
     gre)     local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup gre "$role";;
     ipip)    local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup ipip "$role";;
     sit)     local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup sit "$role";;
     gre6)    local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup gre6 "$role";;
     ip6ip6)  local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup ip6ip6 "$role";;
-    openvpn) local role="${1:-}"; shift || true; parse_args "$@"; [[ $role == server ]] && openvpn_server || openvpn_client;;
-    *) echo "Usage: $0 {menu|connect <token>|advanced|stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn|forward|health|status|down|uninstall} ..."; echo "Easiest:  sudo $0   (opens the menu)"; exit 1;;
+    openvpn) local role="${1:-}"; shift || true; parse_args "$@"; if [[ $role == server ]]; then openvpn_server; else openvpn_client; fi;;
+    backhaul) local role="${1:-}"; shift || true; parse_args "$@"; if [[ $role == server ]]; then backhaul_server; else backhaul_client; fi;;
+    *) echo "Usage: $0 {menu|connect <token>|advanced|stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn|backhaul|forward|health|status|down|uninstall} ..."; echo "Easiest:  sudo $0   (opens the menu)"; exit 1;;
   esac
 }
 main "$@"

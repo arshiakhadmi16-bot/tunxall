@@ -1,0 +1,23 @@
+[client]
+# حالت تک‌سروره (سازگار با قبل)
+remote_addr = "YOUR_SERVER_IP:3080"
+
+# یا برای چند سرور از remote_addrs استفاده کن:
+# remote_addrs = ["1.2.3.4:3080", "5.6.7.8:3080"]
+
+transport = "tcp"
+token = "my_secure_token_change_me"
+connection_pool = 8
+aggressive_pool = false
+keepalive_period = 75
+nodelay = false
+retry_interval = 3
+dial_timeout = 10
+mux_version = 1
+log_level = "info"
+
+# تنظیمات انتخاب خودکار (فقط وقتی remote_addrs داشته باشی فعال می‌شه)
+health_check_interval = 30
+health_check_timeout  = 3
+min_success_rate      = 70
+switch_threshold_ms   = 50
