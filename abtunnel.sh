@@ -1076,9 +1076,10 @@ ui_pause() { echo; read -rp "  ↵  برای برگشت به منو Enter بزن
 ui_banner() {
   ui_clear
   echo
-  echo -e "${U_CY}${U_B}    ▀█▀ █ █ █▄ █ ▀▄▀ ▄▀█ █   █  ${U_0}"
-  echo -e "${U_CY}${U_B}     █  █▄█ █ ▀█ █ █ █▀█ █▄▄ █▄▄${U_0}"
-  echo -e "    ${U_D}ساخت تانل امن بین دو سرور — ساده و سریع${U_0}"
+  echo -e "${U_CY}${U_B}    ╔══════════════════════════════╗${U_0}"
+  echo -e "${U_CY}${U_B}    ║     ✦  T U N X A L L  ✦      ║${U_0}"
+  echo -e "${U_CY}${U_B}    ╚══════════════════════════════╝${U_0}"
+  echo -e "    ${U_D}تانل امن • اسپوف هوشمند • سوئیچ خودکار${U_0}"
   echo
 }
 
@@ -1175,17 +1176,27 @@ easy_server() {
   echo -e "  ${U_D}بعد همان توکن را روی سرور دوم Paste می‌کنید. تمام!${U_0}"
 
   ui_step 1 3 "نوع اتصال را انتخاب کنید"
-  ui_opt 1 "Backhaul TCP"           "سریع و ساده — پیشنهادی"
-  ui_opt 2 "Backhaul TCP مالتی‌پلکس" "چند کاربر روی یک اتصال (tcpmux)"
-  ui_opt 3 "Backhaul gRPC"          "وقتی اتصال TCP معمولی خوب کار نمی‌کند"
-  ui_opt 4 "Backhaul gRPC + TLS"    "رمزگذاری‌شده (grpcs) — شبیه HTTPS"
-  ui_opt 5 "Backhaul WebSocket"     "سازگار با CDN — شبیه HTTPS"
-  ui_opt 6 "OpenVPN"                "شبکه‌ی خصوصی کامل بین دو سرور"
+  ui_opt 1 "Backhaul TCP"              "سریع و ساده — پیشنهادی"
+  ui_opt 2 "Backhaul TCP مالتی‌پلکس"    "چند کاربر روی یک اتصال"
+  ui_opt 3 "🎭 Spoof هوشمند (HTTPS)"   "شبیه ترافیک HTTPS واقعی — دور زدن DPI"
+  ui_opt 4 "Backhaul gRPC"             "وقتی TCP معمولی خوب کار نمی‌کند"
+  ui_opt 5 "Backhaul WebSocket"        "سازگار با CDN"
+  ui_opt 6 "OpenVPN"                   "شبکه‌ی خصوصی کامل"
   ui_opt 0 "برگشت"
   local c; choose c 6 1 || return 0
   [[ $c == 0 ]] && return 0
-  local kind=backhaul transport=tcp
-  case "$c" in 1) transport=tcp;; 2) transport=tcpmux;; 3) transport=grpc;; 4) transport=grpcs;; 5) transport=ws;; 6) kind=openvpn;; esac
+  local kind=backhaul transport=tcp spoof=0
+  case "$c" in
+    1) transport=tcp;;
+    2) transport=tcpmux;;
+    3) transport=grpcs; spoof=1;;   # smart spoof = gRPC-TLS on 443
+    4) transport=grpc;;
+    5) transport=ws;;
+    6) kind=openvpn;;
+  esac
+  if [[ $spoof == 1 ]]; then
+    ui_info "حالت Spoof: ترافیک شبیه HTTPS روی پورت 443 رمزنگاری می‌شود"
+  fi
 
   # Suggest the best open port if a recent netcheck probe saved one.
   local sug_port="" sug_src=""
@@ -1324,6 +1335,20 @@ status_screen() {
     echo; echo -e "  ${U_B}پورت‌فورواردها:${U_0}"
     local f; for f in $DIR/forward-*.rule; do ( . "$f"; echo "   • $PROTO/$IN_PORT → $TO:$TO_PORT" ); done
   fi
+  # Failover panel
+  echo
+  ui_line
+  if systemctl is-active --quiet abtunnel-failover 2>/dev/null; then
+    echo -e "  ${U_G}⚡ سوئیچ خودکار: روشن${U_0}"
+    if [[ -f /etc/abtunnel/failover/active ]]; then
+      echo -e "  ${U_D}تانل فعلی: $(cat /etc/abtunnel/failover/active 2>/dev/null)${U_0}"
+    fi
+    if [[ -f /etc/abtunnel/failover/tunnels.list ]]; then
+      echo -e "  ${U_D}ترتیب: $(grep -v '^#' /etc/abtunnel/failover/tunnels.list | tr '\n' ' ')${U_0}"
+    fi
+  else
+    echo -e "  ${U_D}⚡ سوئیچ خودکار: خاموش${U_0}  ${U_D}(از منو فعال کنید)${U_0}"
+  fi
   ui_pause
 }
 
@@ -1335,6 +1360,57 @@ token_screen() {
   [[ -s $DIR/ovpn-connect.token ]] && { ui_token_box "توکن OpenVPN" "$(cat $DIR/ovpn-connect.token)"; shown=1; }
   [[ $shown == 0 ]] && ui_info "توکنی پیدا نشد. توکن فقط روی «سرور اول» و بعد از ساخت تانل ساخته می‌شود."
   ui_pause
+}
+
+
+failover_screen() {
+  ui_banner
+  ui_title "سوئیچ خودکار تانل (Failover)"
+  echo -e "  ${U_D}اگر تانل فعلی قطع شود، خودکار به تانل بعدی می‌رود.${U_0}"
+  echo
+  ui_opt 1 "فعال‌سازی سوئیچ خودکار"   "نظارت + تعویض هوشمند"
+  ui_opt 2 "وضعیت Failover"
+  ui_opt 3 "خاموش کردن"
+  ui_opt 0 "برگشت"
+  local c; choose c 3 || return 0
+  case "$c" in
+    1)
+      local helper=""
+      for p in "$SCRIPT_DIR/failover.sh" /opt/tunxall/failover.sh /usr/local/lib/tunxall/failover.sh; do
+        [[ -x $p ]] && helper=$p && break
+      done
+      if [[ -z $helper ]]; then
+        ui_err "فایل failover.sh پیدا نشد"
+        ui_pause; return 0
+      fi
+      ui_info "در حال نصب ناظر سوئیچ خودکار..."
+      if bash "$helper" install >>"$LOGFILE" 2>&1; then
+        ui_ok "سوئیچ خودکار فعال شد."
+        echo -e "  ${U_D}هر ۲۰ ثانیه سلامت چک می‌شود؛ بعد از ۳ بار شکست → تانل بعدی${U_0}"
+      else
+        ui_err "نصب ناموفق — جزئیات: $LOGFILE"
+      fi
+      ui_pause
+      ;;
+    2)
+      local helper=""
+      for p in "$SCRIPT_DIR/failover.sh" /opt/tunxall/failover.sh /usr/local/lib/tunxall/failover.sh; do
+        [[ -x $p ]] && helper=$p && break
+      done
+      [[ -n $helper ]] && bash "$helper" status || ui_info "failover پیکربندی نشده"
+      ui_pause
+      ;;
+    3)
+      local helper=""
+      for p in "$SCRIPT_DIR/failover.sh" /opt/tunxall/failover.sh /usr/local/lib/tunxall/failover.sh; do
+        [[ -x $p ]] && helper=$p && break
+      done
+      [[ -n $helper ]] && bash "$helper" stop
+      ui_ok "سوئیچ خودکار خاموش شد."
+      ui_pause
+      ;;
+    0) return 0;;
+  esac
 }
 
 remove_screen() {
@@ -1410,22 +1486,24 @@ wizard() {
     elif (( active == n )); then echo -e "    ${U_G}● $active تانل فعال${U_0}"
     else echo -e "    ${U_Y}● $active از $n تانل فعال${U_0}"; fi
     ui_line
-    ui_opt 1 "ساخت تانل جدید"        "روی سرور اول — یک توکن می‌دهد"
-    ui_opt 2 "وصل شدن با توکن"       "روی سرور دوم — توکن را Paste کنید"
-    ui_opt 3 "وضعیت تانل‌ها"
+    ui_opt 1 "ساخت تانل جدید"           "روی سرور اول — یک توکن می‌دهد"
+    ui_opt 2 "وصل شدن با توکن"          "روی سرور دوم — توکن را Paste کنید"
+    ui_opt 3 "وضعیت تانل‌ها"             "سلامت + سوئیچ خودکار"
     ui_opt 4 "نمایش دوباره توکن"
     ui_opt 5 "حذف تانل"
-    ui_opt 6 "تنظیمات پیشرفته"
+    ui_opt 6 "سوئیچ خودکار (Failover)"  "اگر قطع شد → تانل بعدی"
+    ui_opt 7 "تنظیمات پیشرفته"
     ui_opt 0 "خروج"
     ui_line
-    local c; choose c 6 || exit 0
+    local c; choose c 7 || exit 0
     case "$c" in
       1) easy_server;;
       2) easy_client;;
       3) status_screen;;
       4) token_screen;;
       5) remove_screen;;
-      6) advanced_screen;;
+      6) failover_screen;;
+      7) advanced_screen;;
       0) ui_clear; exit 0;;
     esac
   done

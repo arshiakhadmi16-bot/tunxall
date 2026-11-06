@@ -48,11 +48,12 @@ fi
 
 # --- scripts
 mkdir -p "$DEST" "$LIB"
-for f in abtunnel.sh netcheck.sh wg-tunnel.sh backhaul-helper.sh; do
+for f in abtunnel.sh netcheck.sh wg-tunnel.sh backhaul-helper.sh failover.sh; do
   curl -fsSL --retry 3 "$BASE/$f" -o "$DEST/$f.new" || die "download failed: $f (check this server's internet access)"
   mv -f "$DEST/$f.new" "$DEST/$f"; chmod +x "$DEST/$f"
 done
 cp -f "$DEST/backhaul-helper.sh" "$LIB/backhaul-helper.sh"
+[[ -f $DEST/failover.sh ]] && cp -f "$DEST/failover.sh" "$LIB/failover.sh" || true
 ok "Downloaded tunxall scripts"
 
 declare -A MAP=( [abtunnel]=abtunnel.sh [netcheck]=netcheck.sh [wg-tunnel]=wg-tunnel.sh )
