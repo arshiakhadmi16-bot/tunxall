@@ -112,6 +112,43 @@ detect_pubip() {
   echo "$ip"
 }
 
+# detect_path_mtu <peer> — largest unfragmented packet size to peer (bytes),
+# found with a DF ping sweep. Echoes 0 when ICMP is blocked.
+detect_path_mtu() {
+  local peer="$1" f sz hdr=28 p6=""
+  f=$(ip_family "$peer"); [[ $f == 6 ]] && { hdr=48; p6="-6"; }
+  for sz in 1472 1452 1432 1412 1400 1372 1300 1240 1172; do
+    if ping $p6 -c1 -W2 -M do -s "$sz" "$peer" >/dev/null 2>&1; then echo $((sz + hdr)); return; fi
+  done
+  echo 0
+}
+
+# tunnel_overhead <kind> — bytes of encapsulation for an interface tunnel.
+tunnel_overhead() {
+  case "$1" in
+    gre)    echo 24;;  # 20 (outer IPv4) + 4 (GRE)
+    ipip)   echo 20;;  # 20 (outer IPv4)
+    sit)    echo 20;;  # 20 (outer IPv4), inner IPv6
+    gre6)   echo 44;;  # 40 (outer IPv6) + 4 (GRE)
+    ip6ip6) echo 40;;  # 40 (outer IPv6)
+    *)      echo 24;;
+  esac
+}
+
+# inner_mtu <kind> <peer> — MTU to set on the tunnel interface. Uses the measured
+# path MTU minus encapsulation (and IPsec overhead when a PSK is set); falls back
+# to a safe 1400 when the path MTU can't be measured. Floored at 1280.
+inner_mtu() {
+  local kind="$1" peer="$2" pmtu ov mtu
+  pmtu=$(detect_path_mtu "$peer")
+  [[ $pmtu -gt 0 ]] || { echo 1400; return; }
+  ov=$(tunnel_overhead "$kind")
+  [[ -n ${PSK:-} ]] && ov=$((ov + 73))   # ESP/AES-GCM overhead when IPsec-encrypted
+  mtu=$((pmtu - ov))
+  (( mtu < 1280 )) && mtu=1280
+  echo "$mtu"
+}
+
 mkunit() { # name execstart...
   local name="$1"; shift
   cat > "/etc/systemd/system/$name.service" <<EOF
@@ -279,7 +316,7 @@ EOF
 # IPv6 (gre6/ip6ip6); inner address is IPv4 (gre/ipip) or IPv6 (sit/gre6/ip6ip6).
 # Encrypted with IPsec when --psk is given, otherwise plain (unencrypted).
 iface_tunnel_setup() { # kind role
-  local kind="$1" role="$2"; need_root; apt_install iproute2
+  local kind="$1" role="$2"; need_root; apt_install iproute2 iptables
   [[ -n $PEER ]] || die "need --peer <other server's endpoint IP>"
   local fam myip ifn linkargs mod inner mtu=1400 myaddr peeraddr NET="" NET6=""
   fam=$(ip_family "$PEER"); myip=$(local_ip_to "$PEER"); [[ -n $myip ]] || die "cannot find local IP toward $PEER"
@@ -304,6 +341,13 @@ iface_tunnel_setup() { # kind role
     warn "No --psk: the $kind tunnel is UNENCRYPTED (plain). Add --psk to protect it with IPsec."
   fi
 
+  # Auto-size the tunnel MTU from the measured path MTU to avoid the classic
+  # "tunnel up but large packets stall" problem.
+  mtu=$(inner_mtu "$kind" "$PEER")
+  log "Path MTU to $PEER → tunnel MTU set to $mtu"
+
+  # TCP MSS clamp so forwarded TCP never exceeds the tunnel MTU (IPT = ip/ip6tables).
+  local IPT=iptables; [[ $inner == 6 ]] && IPT=ip6tables
   mkdir -p $DIR && chmod 700 $DIR
   cat > $DIR/$ifn-up.sh <<EOF
 #!/usr/bin/env bash
@@ -312,25 +356,42 @@ ip link del $ifn 2>/dev/null || true
 ip link add $ifn type $linkargs local $myip remote $PEER
 ip addr add $myaddr dev $ifn
 ip link set $ifn mtu $mtu up
+$IPT -t mangle -C FORWARD -o $ifn -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \\
+  || $IPT -t mangle -A FORWARD -o $ifn -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+$IPT -t mangle -C FORWARD -i $ifn -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \\
+  || $IPT -t mangle -A FORWARD -i $ifn -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 EOF
   cat > $DIR/$ifn-down.sh <<EOF
 #!/usr/bin/env bash
+$IPT -t mangle -D FORWARD -o $ifn -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+$IPT -t mangle -D FORWARD -i $ifn -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 ip link set $ifn down 2>/dev/null || true
 ip link del $ifn 2>/dev/null || true
 EOF
   chmod +x $DIR/$ifn-up.sh $DIR/$ifn-down.sh
   mkoneshot "abtunnel-$kind" "$DIR/$ifn-up.sh" "$DIR/$ifn-down.sh"
   enable_forwarding
-  log "$kind tunnel up: this side ${myaddr%/*} <-> peer $peeraddr (iface $ifn, endpoints over IPv$fam)"
+  log "$kind tunnel up: this side ${myaddr%/*} <-> peer $peeraddr (iface $ifn, endpoints over IPv$fam, MTU $mtu)"
   log "Forward a service into the tunnel:  sudo bash abtunnel.sh forward --proto tcp --in-port <PORT> --to $peeraddr --to-port <PORT>"
   log "Test:  ping$([[ $inner == 6 ]] && echo ' -6') -c3 $peeraddr"
   log "Watchdog:  sudo bash abtunnel.sh health --unit abtunnel-$kind --watch-ip $peeraddr"
 }
 
 # ----------------------------------------------------------------- openvpn
+# ovpn_mssfix <peer> — mssfix value (TCP MSS clamp) from the path MTU, so TCP
+# inside the tunnel never fragments. Each side clamps its own; values may differ.
+ovpn_mssfix() {
+  local pmtu m
+  pmtu=$(detect_path_mtu "${1:-1.1.1.1}")
+  if [[ $pmtu -gt 0 ]]; then m=$((pmtu - 80)); else m=1300; fi
+  (( m < 1000 )) && m=1000; (( m > 1400 )) && m=1400
+  echo "$m"
+}
+
 openvpn_server() {
   need_root; apt_install openvpn; mkdir -p $DIR && chmod 700 $DIR
   [[ -f $DIR/ovpn.key ]] || openvpn --genkey secret $DIR/ovpn.key 2>/dev/null || openvpn --genkey --secret $DIR/ovpn.key
+  local mssfix; mssfix=$(ovpn_mssfix)
   cat > $DIR/ovpn.conf <<EOF
 dev tun
 proto udp
@@ -340,6 +401,7 @@ secret $DIR/ovpn.key
 cipher AES-256-CBC
 auth SHA256
 keepalive 10 60
+mssfix $mssfix
 persist-key
 persist-tun
 EOF
@@ -365,6 +427,7 @@ openvpn_client() {
   [[ -n $CERT && -f $CERT ]] || die "need --cert <ovpn.key copied from B>"
   [[ "$CERT" -ef "$DIR/ovpn.key" ]] || cp "$CERT" "$DIR/ovpn.key"
   chmod 600 "$DIR/ovpn.key"
+  local mssfix; mssfix=$(ovpn_mssfix "$PEER")
   cat > $DIR/ovpn.conf <<EOF
 dev tun
 proto udp
@@ -374,6 +437,7 @@ secret $DIR/ovpn.key
 cipher AES-256-CBC
 auth SHA256
 keepalive 10 60
+mssfix $mssfix
 persist-key
 persist-tun
 EOF
@@ -1111,16 +1175,29 @@ easy_server() {
   echo -e "  ${U_D}بعد همان توکن را روی سرور دوم Paste می‌کنید. تمام!${U_0}"
 
   ui_step 1 3 "نوع اتصال را انتخاب کنید"
-  ui_opt 1 "Backhaul TCP"        "سریع و ساده — پیشنهادی"
-  ui_opt 2 "Backhaul gRPC"       "وقتی اتصال TCP معمولی خوب کار نمی‌کند"
-  ui_opt 3 "Backhaul gRPC + TLS" "رمزگذاری‌شده (grpcs)"
-  ui_opt 4 "Backhaul WebSocket"  "سازگار با CDN"
-  ui_opt 5 "OpenVPN"             "شبکه‌ی خصوصی کامل بین دو سرور"
+  ui_opt 1 "Backhaul TCP"           "سریع و ساده — پیشنهادی"
+  ui_opt 2 "Backhaul TCP مالتی‌پلکس" "چند کاربر روی یک اتصال (tcpmux)"
+  ui_opt 3 "Backhaul gRPC"          "وقتی اتصال TCP معمولی خوب کار نمی‌کند"
+  ui_opt 4 "Backhaul gRPC + TLS"    "رمزگذاری‌شده (grpcs) — شبیه HTTPS"
+  ui_opt 5 "Backhaul WebSocket"     "سازگار با CDN — شبیه HTTPS"
+  ui_opt 6 "OpenVPN"                "شبکه‌ی خصوصی کامل بین دو سرور"
   ui_opt 0 "برگشت"
-  local c; choose c 5 1 || return 0
+  local c; choose c 6 1 || return 0
   [[ $c == 0 ]] && return 0
   local kind=backhaul transport=tcp
-  case "$c" in 1) transport=tcp;; 2) transport=grpc;; 3) transport=grpcs;; 4) transport=ws;; 5) kind=openvpn;; esac
+  case "$c" in 1) transport=tcp;; 2) transport=tcpmux;; 3) transport=grpc;; 4) transport=grpcs;; 5) transport=ws;; 6) kind=openvpn;; esac
+
+  # Suggest the best open port if a recent netcheck probe saved one.
+  local sug_port="" sug_src=""
+  if [[ -f $DIR/netcheck.env ]]; then
+    ( . "$DIR/netcheck.env" 2>/dev/null; echo "${BEST_PORT:-}" ) > /tmp/.abt_sug 2>/dev/null || true
+    sug_port=$(cat /tmp/.abt_sug 2>/dev/null); rm -f /tmp/.abt_sug
+    [[ -n $sug_port ]] && sug_src="(از نتیجه‌ی netcheck)"
+  fi
+  # HTTPS-looking transports work best on 443; plain TCP uses a high port.
+  local def_tport=3080
+  case "$transport" in grpc|grpcs|ws|wss) def_tport=443;; esac
+  [[ -n $sug_port ]] && def_tport=$sug_port
 
   local users_ports="" svc_port="" tport
   ui_step 2 3 "پورت‌ها"
@@ -1131,8 +1208,9 @@ easy_server() {
       echo -e "  ${U_D}سرویس روی سرور دوم روی چه پورتی است؟ (اگر همان است فقط Enter بزنید)${U_0}"
       ask svc_port "پورت سرویس روی سرور دوم" "$users_ports" '^[0-9]{1,5}$' || return 0
     fi
+    [[ -n $sug_src ]] && ui_info "پیشنهاد پورت ارتباط: ${U_B}$def_tport${U_0} $sug_src"
     while true; do
-      ask tport "پورت ارتباط بین دو سرور" "3080" '^[0-9]{1,5}$' || return 0
+      ask tport "پورت ارتباط بین دو سرور" "$def_tport" '^[0-9]{1,5}$' || return 0
       port_in_use "$tport" && ! systemctl is-active --quiet abtunnel-backhaul 2>/dev/null \
         && { ui_err "پورت $tport الان توسط برنامه‌ی دیگری استفاده می‌شود؛ پورت دیگری انتخاب کنید"; continue; }
       break

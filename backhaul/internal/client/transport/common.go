@@ -13,6 +13,11 @@ import (
 
 const helloTimeout = 3 * time.Second
 
+// controlIdleTimeout: reconnect if no byte (heartbeat/signal) arrives from the
+// server within this window. Comfortably above the default 20s heartbeat so it
+// never misfires, while still catching a black-holed link within ~2 minutes.
+const controlIdleTimeout = 120 * time.Second
+
 // clientSession is the state of one control-channel session. A new one is created
 // every time the client (re)connects, so goroutines of an old session never touch
 // the counters or context of the new one.
@@ -76,6 +81,10 @@ func runControl(transportCtx context.Context, sess *clientSession, conn net.Conn
 	defer stop()
 
 	for {
+		// The server sends a heartbeat every ~20s; if nothing arrives within
+		// controlIdleTimeout the link is silently dead (black-holed), so drop it
+		// and reconnect instead of waiting on TCP keepalive.
+		_ = conn.SetReadDeadline(time.Now().Add(controlIdleTimeout))
 		msg, err := utils.ReceiveBinaryByte(conn)
 		if err != nil {
 			if sess.ctx.Err() == nil {

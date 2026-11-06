@@ -10,13 +10,13 @@ func applyDefaults(cfg *config.Config) {
 		cfg.Server.Transport = config.TCP
 	}
 	if cfg.Server.Keepalive == 0 {
-		cfg.Server.Keepalive = 75
+		cfg.Server.Keepalive = 30 // TCP keepalive; detect a dead peer sooner
 	}
 	if cfg.Server.ChannelSize == 0 {
 		cfg.Server.ChannelSize = 2048
 	}
 	if cfg.Server.Heartbeat == 0 {
-		cfg.Server.Heartbeat = 40
+		cfg.Server.Heartbeat = 20 // control-channel heartbeat (was 40)
 	}
 	if cfg.Server.MuxCon == 0 {
 		cfg.Server.MuxCon = 8
@@ -48,10 +48,10 @@ func applyDefaults(cfg *config.Config) {
 		cfg.Client.ConnectionPool = 8
 	}
 	if cfg.Client.RetryInterval == 0 {
-		cfg.Client.RetryInterval = 3
+		cfg.Client.RetryInterval = 2 // reconnect faster after a drop (was 3)
 	}
 	if cfg.Client.Keepalive == 0 {
-		cfg.Client.Keepalive = 75
+		cfg.Client.Keepalive = 30 // TCP keepalive; detect a dead peer sooner
 	}
 	if cfg.Client.DialTimeout == 0 {
 		cfg.Client.DialTimeout = 10
@@ -77,7 +77,7 @@ func applyDefaults(cfg *config.Config) {
 
 	// Health check defaults
 	if cfg.Client.HealthCheckInterval == 0 {
-		cfg.Client.HealthCheckInterval = 30
+		cfg.Client.HealthCheckInterval = 15 // probe servers more often (was 30)
 	}
 	if cfg.Client.HealthCheckTimeout == 0 {
 		cfg.Client.HealthCheckTimeout = 3

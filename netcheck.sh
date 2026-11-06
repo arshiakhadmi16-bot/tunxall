@@ -82,6 +82,7 @@ cmd_stop() {
 
 # ---------------------------------------------------------------- probe (A)
 OPEN_TCP=""
+PATH_MTU=0
 probe_tcp() {
   echo "== TCP ports =="
   for p in $PORTS; do
@@ -117,8 +118,29 @@ probe_mtu() {
   for sz in 1472 1400 1300 1200; do
     if ping -c1 -W2 -M do -s $sz "$TARGET" >/dev/null 2>&1; then best=$((sz+28)); break; fi
   done
+  PATH_MTU=$best
   if [[ $best -gt 0 ]]; then ok "largest unfragmented packet ~ ${best} bytes MTU"
   else warn "could not determine MTU via ICMP (ICMP may be blocked)"; fi
+}
+
+# Save the result so `abtunnel` can suggest the best open port automatically.
+save_result() {
+  [[ $EUID -eq 0 ]] || return 0
+  mkdir -p /etc/abtunnel 2>/dev/null || return 0
+  # Prefer 443, then 8080/8443, otherwise the first open port.
+  local best="" p
+  for p in 443 8443 8080 2096 2053; do
+    for o in $OPEN_TCP; do [[ $o == "$p" ]] && best=$p && break 2; done
+  done
+  [[ -z $best ]] && best=$(echo $OPEN_TCP | awk '{print $1}')
+  {
+    echo "TARGET=$TARGET"
+    echo "OPEN_TCP=\"$(echo $OPEN_TCP | xargs)\""
+    echo "BEST_PORT=$best"
+    echo "PATH_MTU=$PATH_MTU"
+    echo "WHEN=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > /etc/abtunnel/netcheck.env
+  chmod 600 /etc/abtunnel/netcheck.env 2>/dev/null || true
 }
 
 probe_throughput() {
@@ -159,7 +181,9 @@ cmd_probe() {
   probe_cut
   echo "======================================================="
   log "OPEN ports:${OPEN_TCP:-  none}"
+  save_result
   log "Pick an OPEN port with the best throughput and set up a standard tunnel on it (abtunnel menu)."
+  [[ -f /etc/abtunnel/netcheck.env ]] && log "Saved — the abtunnel menu will suggest the best open port automatically."
 }
 
 main() {
