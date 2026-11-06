@@ -112,6 +112,17 @@ detect_pubip() {
   echo "$ip"
 }
 
+# detect_pubip_fam <4|6> — public IP of the requested family.
+detect_pubip_fam() {
+  if [[ ${1:-4} == 6 ]]; then
+    curl -6 -fsS --max-time 5 https://ifconfig.co 2>/dev/null \
+      || curl -6 -fsS --max-time 5 https://api6.ipify.org 2>/dev/null \
+      || ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}'
+  else
+    detect_pubip
+  fi
+}
+
 # detect_path_mtu <peer> — largest unfragmented packet size to peer (bytes),
 # found with a DF ping sweep. Echoes 0 when ICMP is blocked.
 detect_path_mtu() {
@@ -394,9 +405,10 @@ openvpn_server() {
   need_root; apt_install openvpn; mkdir -p $DIR && chmod 700 $DIR
   [[ -f $DIR/ovpn.key ]] || openvpn --genkey secret $DIR/ovpn.key 2>/dev/null || openvpn --genkey --secret $DIR/ovpn.key
   local mssfix; mssfix=$(ovpn_mssfix)
+  local oproto=udp; [[ ${FAM:-4} == 6 ]] && oproto=udp6
   cat > $DIR/ovpn.conf <<EOF
 dev tun
-proto udp
+proto $oproto
 port $OVPN_PORT
 ifconfig 10.30.0.1 10.30.0.2
 secret $DIR/ovpn.key
@@ -432,9 +444,10 @@ openvpn_client() {
   [[ "$CERT" -ef "$DIR/ovpn.key" ]] || cp "$CERT" "$DIR/ovpn.key"
   chmod 600 "$DIR/ovpn.key"
   local mssfix; mssfix=$(ovpn_mssfix "$PEER")
+  local oproto=udp; [[ $PEER == *:* ]] && oproto=udp6   # IPv6 peer → udp6
   cat > $DIR/ovpn.conf <<EOF
 dev tun
-proto udp
+proto $oproto
 remote $PEER $OVPN_PORT
 ifconfig 10.30.0.2 10.30.0.1
 secret $DIR/ovpn.key
@@ -1196,66 +1209,99 @@ unit_label() { # friendly name of a unit
 }
 
 # ---------------------------------------------------------------- screens
+# smart_pick_backhaul — choose transport + tport automatically. Picks the first
+# locally-free port (a real local test), preferring a saved netcheck best port and
+# HTTPS-looking ports; uses grpcs (TLS, looks like HTTPS) there, else tcpmux.
+# Sets the caller's `transport` and `tport` (bash dynamic scope).
+smart_pick_backhaul() {
+  local cand=() p b
+  if [[ -f $DIR/netcheck.env ]]; then
+    b=$( . "$DIR/netcheck.env" 2>/dev/null; echo "${BEST_PORT:-}" )
+    [[ $b =~ ^[0-9]+$ ]] && cand+=("$b")
+  fi
+  cand+=(443 8443 2096 2083 3080 8080)
+  tport=""
+  for p in "${cand[@]}"; do
+    [[ $p =~ ^[0-9]+$ ]] || continue
+    if ! port_in_use "$p"; then tport=$p; break; fi
+  done
+  [[ -z $tport ]] && tport=3080
+  case "$tport" in 443|8443|2096|2083|2087|2053) transport=grpcs;; *) transport=tcpmux;; esac
+}
+
 easy_server() {
   ui_banner
   ui_title "ساخت تانل جدید (روی سرور اول)"
   echo -e "  ${U_D}این سرور تانل را می‌سازد و یک «توکن» به شما می‌دهد.${U_0}"
   echo -e "  ${U_D}بعد همان توکن را روی سرور دوم Paste می‌کنید. تمام!${U_0}"
 
-  ui_step 1 3 "نوع اتصال را انتخاب کنید"
-  ui_opt 1 "Backhaul TCP"              "سریع و ساده — پیشنهادی"
-  ui_opt 2 "Backhaul TCP مالتی‌پلکس"    "چند کاربر روی یک اتصال"
-  ui_opt 3 "🎭 Spoof هوشمند (HTTPS)"   "شبیه ترافیک HTTPS واقعی — دور زدن DPI"
-  ui_opt 4 "Backhaul gRPC"             "وقتی TCP معمولی خوب کار نمی‌کند"
-  ui_opt 5 "Backhaul WebSocket"        "سازگار با CDN"
-  ui_opt 6 "OpenVPN"                   "شبکه‌ی خصوصی کامل"
-  ui_opt 0 "برگشت"
-  local c; choose c 6 1 || return 0
-  [[ $c == 0 ]] && return 0
-  local kind=backhaul transport=tcp spoof=0
-  case "$c" in
-    1) transport=tcp;;
-    2) transport=tcpmux;;
-    3) transport=grpcs; spoof=1;;   # smart spoof = gRPC-TLS on 443
-    4) transport=grpc;;
-    5) transport=ws;;
-    6) kind=openvpn;;
-  esac
-  if [[ $spoof == 1 ]]; then
-    ui_info "حالت Spoof: ترافیک شبیه HTTPS روی پورت 443 رمزنگاری می‌شود"
+  # ---- Step 1: IP family ----
+  ui_step 1 4 "نسخه IP تانل"
+  ui_opt 1 "IPv4" "معمولی — اکثر سرورها"
+  ui_opt 2 "IPv6"
+  local famc; choose famc 2 1 || return 0
+  local FAM=4; [[ $famc == 2 ]] && FAM=6
+
+  # ---- Step 2: smart or manual protocol ----
+  ui_step 2 4 "انتخاب پروتکل"
+  ui_opt 1 "هوشمند (خودکار)"        "بهترین پورت و پروتکل را خودش انتخاب و راه‌اندازی می‌کند"
+  ui_opt 2 "دستی (خودم انتخاب کنم)"
+  local modec; choose modec 2 1 || return 0
+
+  local kind=backhaul transport=tcp tport="" users_ports="" svc_port=""
+
+  if [[ $modec == 1 ]]; then
+    smart_pick_backhaul    # sets transport + tport from a local port test + netcheck hint
+    ui_ok "انتخاب هوشمند: ${U_B}Backhaul / ${transport}${U_0} روی پورت ${U_B}${tport}${U_0}  (IPv${FAM})"
+    echo -e "  ${U_D}grpcs روی 443 شبیه HTTPS است و از اکثر فایروال‌ها رد می‌شود؛ tcpmux چند کاربر را روی یک اتصال می‌برد.${U_0}"
+  else
+    ui_step 3 4 "نوع اتصال"
+    ui_opt 1 "Backhaul TCP"               "سریع و ساده"
+    ui_opt 2 "Backhaul TCP مالتی‌پلکس"     "چند کاربر روی یک اتصال"
+    ui_opt 3 "Backhaul gRPC + TLS (443)"  "شبیه HTTPS — رد شدن از فایروال/DPI"
+    ui_opt 4 "Backhaul gRPC"              "وقتی TCP معمولی خوب کار نمی‌کند"
+    ui_opt 5 "Backhaul WebSocket"         "سازگار با CDN"
+    ui_opt 6 "OpenVPN"                    "شبکه‌ی خصوصی کامل"
+    ui_opt 0 "برگشت"
+    local c; choose c 6 1 || return 0
+    [[ $c == 0 ]] && return 0
+    case "$c" in
+      1) transport=tcp;; 2) transport=tcpmux;; 3) transport=grpcs;; 4) transport=grpc;; 5) transport=ws;; 6) kind=openvpn;;
+    esac
+
+    # default tunnel port: netcheck hint, else 443 for HTTPS-looking transports, else 3080
+    local sug_port="" sug_src=""
+    if [[ -f $DIR/netcheck.env ]]; then
+      sug_port=$( . "$DIR/netcheck.env" 2>/dev/null; echo "${BEST_PORT:-}" )
+      [[ -n $sug_port ]] && sug_src="(از نتیجه‌ی netcheck)"
+    fi
+    local def_tport=3080
+    case "$transport" in grpc|grpcs|ws|wss) def_tport=443;; esac
+    [[ -n $sug_port ]] && def_tport=$sug_port
+
+    if [[ $kind == backhaul ]]; then
+      [[ -n $sug_src ]] && ui_info "پیشنهاد پورت ارتباط: ${U_B}$def_tport${U_0} $sug_src"
+      while true; do
+        ask tport "پورت ارتباط بین دو سرور" "$def_tport" '^[0-9]{1,5}$' || return 0
+        port_in_use "$tport" && ! systemctl is-active --quiet abtunnel-backhaul 2>/dev/null \
+          && { ui_err "پورت $tport الان توسط برنامه‌ی دیگری استفاده می‌شود؛ پورت دیگری انتخاب کنید"; continue; }
+        break
+      done
+    else
+      ask tport "پورت UDP برای OpenVPN" "1194" '^[0-9]{1,5}$' || return 0
+    fi
   fi
 
-  # Suggest the best open port if a recent netcheck probe saved one.
-  local sug_port="" sug_src=""
-  if [[ -f $DIR/netcheck.env ]]; then
-    ( . "$DIR/netcheck.env" 2>/dev/null; echo "${BEST_PORT:-}" ) > /tmp/.abt_sug 2>/dev/null || true
-    sug_port=$(cat /tmp/.abt_sug 2>/dev/null); rm -f /tmp/.abt_sug
-    [[ -n $sug_port ]] && sug_src="(از نتیجه‌ی netcheck)"
-  fi
-  # HTTPS-looking transports work best on 443; plain TCP uses a high port.
-  local def_tport=3080
-  case "$transport" in grpc|grpcs|ws|wss) def_tport=443;; esac
-  [[ -n $sug_port ]] && def_tport=$sug_port
-
-  local users_ports="" svc_port="" tport
-  ui_step 2 3 "پورت‌ها"
+  # ---- Step: which service to expose (auto port-forward) ----
+  ui_step 4 4 "سرویسی که باید در دسترس شود"
   if [[ $kind == backhaul ]]; then
-    echo -e "  ${U_D}کاربرها به کدام پورتِ این سرور وصل شوند؟ (چند پورت را با کاما جدا کنید، مثلاً 443,8080)${U_0}"
+    echo -e "  ${U_D}کاربرها به کدام پورتِ این سرور وصل شوند؟ (چند پورت با کاما، مثلاً 443,8080)${U_0}"
     ask users_ports "پورت کاربرها" "443" '^[0-9]{1,5}(-[0-9]{1,5})?(,[0-9]{1,5}(-[0-9]{1,5})?)*$' "مثل 443 یا 443,8080 یا 2000-2010 وارد کنید" || return 0
     if [[ $users_ports =~ ^[0-9]+$ ]]; then
       echo -e "  ${U_D}سرویس روی سرور دوم روی چه پورتی است؟ (اگر همان است فقط Enter بزنید)${U_0}"
       ask svc_port "پورت سرویس روی سرور دوم" "$users_ports" '^[0-9]{1,5}$' || return 0
     fi
-    [[ -n $sug_src ]] && ui_info "پیشنهاد پورت ارتباط: ${U_B}$def_tport${U_0} $sug_src"
-    while true; do
-      ask tport "پورت ارتباط بین دو سرور" "$def_tport" '^[0-9]{1,5}$' || return 0
-      port_in_use "$tport" && ! systemctl is-active --quiet abtunnel-backhaul 2>/dev/null \
-        && { ui_err "پورت $tport الان توسط برنامه‌ی دیگری استفاده می‌شود؛ پورت دیگری انتخاب کنید"; continue; }
-      break
-    done
   else
-    ask tport "پورت UDP برای OpenVPN" "1194" '^[0-9]{1,5}$' || return 0
-    echo
     if confirm "یک سرویس از سرور دوم را خودکار روی این سرور در دسترس کنم؟"; then
       ask users_ports "روی کدام پورت این سرور؟ (مثلاً 443 یا 80,443)" "443" '^[0-9]{1,5}(,[0-9]{1,5})*$' "مثل 443 یا 80,443 وارد کنید" || return 0
       if [[ $users_ports =~ ^[0-9]+$ ]]; then
@@ -1265,10 +1311,11 @@ easy_server() {
     fi
   fi
 
-  ui_step 3 3 "آدرس این سرور"
-  local pub; pub=$(detect_pubip)
-  if [[ -n $pub ]] && { echo -e "  IP عمومی این سرور: ${U_B}$pub${U_0}"; confirm "درست است؟"; }; then :
-  else ask pub "IP عمومی این سرور" "" '^[0-9A-Fa-f.:]+$' "یک IP معتبر وارد کنید" || return 0; fi
+  # ---- Public IP (family-aware) ----
+  echo
+  local pub; pub=$(detect_pubip_fam "$FAM")
+  if [[ -n $pub ]] && { echo -e "  IP عمومی این سرور (IPv${FAM}): ${U_B}$pub${U_0}"; confirm "درست است؟"; }; then :
+  else ask pub "IP عمومی این سرور (IPv${FAM})" "" '^[][0-9A-Fa-f.:]+$' "یک IP معتبر وارد کنید" || return 0; fi
 
   echo; ui_line
   ui_info "اولین بار ممکن است یکی دو دقیقه طول بکشد..."
@@ -1276,13 +1323,13 @@ easy_server() {
   if [[ $kind == backhaul ]]; then
     local mapping="$users_ports"
     [[ -n $svc_port && $svc_port != "$users_ports" ]] && mapping="$users_ports=$svc_port"
-    _mk() { BH_QUIET=1 PUBLIC_IP="$1" ACCEPT_PORT="$2" PSK="" TRANSPORT="$3" PORTS="$4" backhaul_server; }
-    spin "ساخت تانل Backhaul ($transport)" _mk "$pub" "$tport" "$transport" "$mapping" && ok=1
+    _mk() { BH_QUIET=1 FAM="$5" PUBLIC_IP="$1" ACCEPT_PORT="$2" PSK="" TRANSPORT="$3" PORTS="$4" backhaul_server; }
+    spin "ساخت تانل Backhaul ($transport)" _mk "$pub" "$tport" "$transport" "$mapping" "$FAM" && ok=1
     token_file=$DIR/backhaul/connect.token
     [[ $ok == 1 ]] && open_firewall tcp "$tport" ${users_ports//,/ }
   else
-    _mk() { BH_QUIET=1 PUBLIC_IP="$1" OVPN_PORT="$2" FWD_PORTS="$3" FWD_SVC="$4" openvpn_server; }
-    spin "ساخت تانل OpenVPN" _mk "$pub" "$tport" "$users_ports" "$svc_port" && ok=1
+    _mk() { BH_QUIET=1 FAM="$5" PUBLIC_IP="$1" OVPN_PORT="$2" FWD_PORTS="$3" FWD_SVC="$4" openvpn_server; }
+    spin "ساخت تانل OpenVPN" _mk "$pub" "$tport" "$users_ports" "$svc_port" "$FAM" && ok=1
     token_file=$DIR/ovpn-connect.token
     if [[ $ok == 1 ]]; then
       open_firewall udp "$tport"

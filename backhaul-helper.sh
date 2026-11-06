@@ -17,7 +17,20 @@ need_root() { [[ $EUID -eq 0 ]] || die "Run as root (sudo)."; }
 # Values below are written into TOML, so keep them to safe characters.
 check_token()     { [[ $1 =~ ^[A-Za-z0-9_.-]+$ ]] || die "token may only contain letters, digits, '_', '.', '-'"; }
 check_transport() { [[ $1 =~ ^(tcp|tcpmux|ws|wss|grpc|grpcs)$ ]] || die "transport must be tcp, tcpmux, ws, wss, grpc or grpcs"; }
-check_addr()      { [[ $1 =~ ^[A-Za-z0-9.:\[\]-]+$ ]] || die "invalid address: $1"; }
+check_addr()      { [[ $1 =~ ^[][A-Za-z0-9.:-]+$ ]] || die "invalid address: $1"; }
+
+# bh_addr <host-or-hostport> <default-port> — produce a valid host:port, adding
+# brackets for a bare IPv6 address so TOML/Go parse it correctly.
+bh_addr() {
+  local a="$1" port="$2"
+  case "$a" in
+    \[*\]:*) echo "$a";;          # [v6]:port (already complete)
+    \[*\])   echo "$a:$port";;     # [v6] without port
+    *:*:*)   echo "[$a]:$port";;   # bare IPv6 -> bracket + port
+    *:*)     echo "$a";;           # host:port (IPv4 / hostname)
+    *)       echo "$a:$port";;     # bare host -> append port
+  esac
+}
 
 # ---------- ensure binary ----------
 TUNXALL_REPO="${TUNXALL_REPO:-arshiakhadmi16-bot/tunxall}"
@@ -130,6 +143,8 @@ backhaul_server() {
   local ports_list="${PORTS:-443,8080}"
   check_token "$token"; check_transport "$transport"
   [[ $bind_port =~ ^[0-9]+$ ]] || die "invalid port: $bind_port"
+  # Bind family: IPv4 (0.0.0.0) by default, IPv6 ([::]) when FAM=6.
+  local bind_host="0.0.0.0"; [[ ${FAM:-4} == 6 ]] && bind_host="[::]"
 
   # TLS transports (wss / grpcs) need a certificate; create a self-signed one once.
   local tls_toml=""
@@ -154,7 +169,7 @@ backhaul_server() {
 
   cat > "$BH_DIR/server.toml" <<EOF
 [server]
-bind_addr = "0.0.0.0:${bind_port}"
+bind_addr = "${bind_host}:${bind_port}"
 transport = "${transport}"
 token = "${token}"
 keepalive_period = 75
@@ -191,13 +206,19 @@ EOF
   systemctl restart abtunnel-backhaul.service   # pick up the new config even if it was already running
   # Connection token for the other server (also saved so the menu can show it again)
   local pub="${PUBLIC_IP:-}"
-  [[ -n $pub ]] || pub=$(curl -4 -fs --max-time 4 ifconfig.me 2>/dev/null || curl -4 -fs --max-time 4 icanhazip.com 2>/dev/null || echo "YOUR_PUBLIC_IP")
+  if [[ -z $pub ]]; then
+    if [[ ${FAM:-4} == 6 ]]; then
+      pub=$(curl -6 -fs --max-time 4 ifconfig.co 2>/dev/null || curl -6 -fs --max-time 4 icanhazip.com 2>/dev/null || echo "YOUR_PUBLIC_IPv6")
+    else
+      pub=$(curl -4 -fs --max-time 4 ifconfig.me 2>/dev/null || curl -4 -fs --max-time 4 icanhazip.com 2>/dev/null || echo "YOUR_PUBLIC_IP")
+    fi
+  fi
   local client_token
   client_token=$(printf 'T=backhaul;PEER=%s;PORT=%s;TOKEN=%s;TRANSPORT=%s' "$pub" "$bind_port" "$token" "$transport" | base64 | tr -d '\n')
   printf '%s\n' "$client_token" > "$BH_DIR/connect.token"; chmod 600 "$BH_DIR/connect.token"
 
   [[ -n ${BH_QUIET:-} ]] && return 0
-  log "Backhaul SERVER up on 0.0.0.0:${bind_port}  transport=${transport}"
+  log "Backhaul SERVER up on ${bind_host}:${bind_port}  transport=${transport}"
   echo
   echo -e "${c_y}========== CLIENT TOKEN (copy this) ==========${c_0}"
   echo "$client_token"
@@ -217,17 +238,16 @@ backhaul_client() {
   local token="${PSK:-}"
   local pool="${CONNECTION_POOL:-8}"
 
-  # Support multiple peers: PEER can be "ip1:port,ip2:port" or single
+  # Support multiple peers (PEERS="a,b") or a single PEER. Each entry is
+  # normalized to host:port, with IPv6 bracketed, via bh_addr.
+  local defport="${ACCEPT_PORT:-3080}"
   local addrs=()
   if [[ -n "${PEERS:-}" ]]; then
-    IFS=',' read -ra addrs <<< "$PEERS"
+    local _raw a
+    IFS=',' read -ra _raw <<< "$PEERS"
+    for a in "${_raw[@]}"; do a=$(echo "$a" | xargs); [[ -n $a ]] && addrs+=("$(bh_addr "$a" "$defport")"); done
   elif [[ -n "${PEER:-}" ]]; then
-    # PEER may already contain :port
-    if [[ "$PEER" == *:* ]]; then
-      addrs=("$PEER")
-    else
-      addrs=("${PEER}:${ACCEPT_PORT:-3080}")
-    fi
+    addrs=("$(bh_addr "$PEER" "$defport")")
   else
     die "backhaul client needs --peer or PEERS"
   fi
