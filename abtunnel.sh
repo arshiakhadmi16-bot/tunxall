@@ -1552,22 +1552,61 @@ speed_peer_ip() {
 # parse the receiver Mbit/s from iperf3 -f m output (prefer the SUM line with -P)
 speed_parse() { awk '/receiver/{v=$(NF-2)} /SUM/&&/receiver/{s=$(NF-2)} END{print (s!="" ? s : v)}'; }
 
+# bh_remote_host — the backhaul server's public IP from this host's client.toml
+bh_remote_host() {
+  local f="$DIR/backhaul/client.toml" hp
+  [[ -f $f ]] || return 0
+  hp=$(grep -oE '"[^"]+:[0-9]+"' "$f" | head -1 | tr -d '"')
+  [[ -n $hp ]] || return 0
+  case "$hp" in
+    \[*\]:*) hp=${hp%]*}; echo "${hp#[}";;   # [ipv6]:port
+    *:*)     echo "${hp%:*}";;
+    *)       echo "$hp";;
+  esac
+}
+
+# close_firewall <proto> <port...> — reverse of open_firewall (best effort)
+close_firewall() {
+  local proto="$1"; shift; local p
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    for p in "$@"; do ufw delete allow "$p/$proto" >/dev/null 2>&1 || true; done
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    for p in "$@"; do firewall-cmd --permanent --remove-port="$p/$proto" >/dev/null 2>&1 || true; done
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+}
+
 speed_screen() {
   ui_banner
   ui_title "تست سرعت روی تانل"
-  echo -e "  ${U_D}سرعت واقعی داده بین دو سرور را از داخل تانل اندازه می‌گیرد (با iperf3).${U_0}"
+  echo -e "  ${U_D}سرعت واقعی داده بین دو سرور را اندازه می‌گیرد (با iperf3).${U_0}"
 
-  local has_iface=""; has_iface=$(speed_peer_ip)
-  if [[ -z $has_iface ]]; then
-    ui_info "تانل اینترفیسی فعالی پیدا نشد (openvpn/gre/ipip/wireguard)."
-    echo -e "  ${U_D}برای Backhaul، سرعتِ روی تانل تقریباً برابر سرعت مسیر است؛ با «netcheck» مسیر را بسنجید:${U_0}"
-    echo -e "  ${U_CY}sudo netcheck server${U_0}   و روی سرور دیگر   ${U_CY}sudo netcheck probe --target <IP>${U_0}"
+  # Interface tunnels (openvpn/gre/…) have an inner IP → measure straight over it.
+  # Backhaul has no inner IP → measure the public path (the tunnel's practical ceiling).
+  local iface_peer bh_role="" bh_peer="" mode=""
+  iface_peer=$(speed_peer_ip)
+  [[ -f $DIR/backhaul/server.toml ]] && bh_role=server
+  [[ -f $DIR/backhaul/client.toml ]] && { bh_role=client; bh_peer=$(bh_remote_host); }
+
+  if [[ -n $iface_peer ]]; then
+    mode=iface
+  elif [[ -n $bh_role ]]; then
+    mode=path
+    echo
+    ui_info "تانل Backhaul شناسایی شد — سرعت از مسیر عمومی بین دو سرور سنجیده می‌شود (سقف عملی تانل)."
+    if [[ $bh_role == server ]]; then
+      echo -e "  ${U_D}این «سرور اول» است → اینجا «گیرنده»؛ «فرستنده» را روی سرور دوم بزنید.${U_0}"
+    else
+      echo -e "  ${U_D}این «سرور دوم» است → اینجا «فرستنده»؛ «گیرنده» را روی سرور اول بزنید.${U_0}"
+    fi
+  else
+    ui_info "هیچ تانل فعالی پیدا نشد. اول یک تانل بسازید، بعد تست سرعت را بزنید."
     ui_pause; return 0
   fi
 
   echo
-  ui_opt 1 "گیرنده (این سرور منتظر بماند)" "روی یکی از دو سرور"
-  ui_opt 2 "فرستنده (شروع تست)"            "روی سرور دیگر"
+  ui_opt 1 "گیرنده (این سرور منتظر بماند)" "iperf سرور"
+  ui_opt 2 "فرستنده (شروع تست)"            "تست را اجرا می‌کند"
   ui_opt 0 "برگشت"
   local c; choose c 2 || return 0
   [[ $c == 0 ]] && return 0
@@ -1578,20 +1617,34 @@ speed_screen() {
   fi
 
   if [[ $c == 1 ]]; then
-    local bind; bind=$(speed_local_ip)
+    # listener
+    local bind="" opened=0
+    if [[ $mode == iface ]]; then
+      bind=$(speed_local_ip)
+    else
+      open_firewall tcp "$SPEED_PORT"; opened=1
+    fi
     ui_ok "گیرنده آماده شد${bind:+ (روی $bind)} — پورت $SPEED_PORT"
-    echo -e "  ${U_D}حالا روی سرور دیگر «فرستنده» را اجرا کنید. بعد از پایان تست، همین‌جا Enter بزنید.${U_0}"
+    echo -e "  ${U_D}حالا روی سرور دیگر «فرستنده» را اجرا کنید. بعد از پایان، اینجا Enter بزنید.${U_0}"
     local pid
     iperf3 -s ${bind:+-B "$bind"} -p "$SPEED_PORT" >>"$LOGFILE" 2>&1 &
     pid=$!
     read -rp "  ↵  Enter برای توقف گیرنده " _ || true
     kill "$pid" 2>/dev/null || true
+    (( opened )) && close_firewall tcp "$SPEED_PORT"
     ui_ok "گیرنده متوقف شد."
     ui_pause
   else
-    local ip
-    ui_info "IP داخلی طرف مقابل روی تانل${has_iface:+ (پیشنهاد: $has_iface)}:"
-    ask ip "IP طرف مقابل" "$has_iface" '^[0-9A-Fa-f.:]+$' "یک IP معتبر وارد کنید" || return 0
+    # tester
+    local ip prefill
+    if [[ $mode == iface ]]; then
+      prefill=$iface_peer
+      ui_info "IP داخلی طرف مقابل روی تانل${prefill:+ (پیشنهاد: $prefill)}:"
+    else
+      prefill=$bh_peer
+      ui_info "IP عمومی سرور مقابل (گیرنده)${prefill:+ (پیشنهاد: $prefill)}:"
+    fi
+    ask ip "IP طرف مقابل" "$prefill" '^[0-9A-Fa-f.:]+$' "یک IP معتبر وارد کنید" || return 0
     echo; ui_info "در حال تست (چند ثانیه)... مطمئن شوید روی سرور دیگر «گیرنده» فعال است."
     local p6=""; [[ $ip == *:* ]] && p6="-6"
     local up down
@@ -1599,14 +1652,19 @@ speed_screen() {
     down=$(iperf3 -c "$ip" $p6 -p "$SPEED_PORT" -t 8 -P 4 -f m -R 2>/dev/null | speed_parse)
     echo; ui_line
     if [[ -n $up || -n $down ]]; then
-      ui_ok "${U_B}نتیجه‌ی تست سرعت تانل:${U_0}"
+      local label="روی تانل"; [[ $mode == path ]] && label="مسیر بین دو سرور (سقف عملی تانل backhaul)"
+      ui_ok "${U_B}نتیجه‌ی تست سرعت — $label:${U_0}"
       echo -e "   ⬆️  ارسال (این سرور → طرف مقابل):   ${U_B}${up:-?} Mbit/s${U_0}"
       echo -e "   ⬇️  دریافت (طرف مقابل → این سرور):  ${U_B}${down:-?} Mbit/s${U_0}"
     else
       ui_err "تست انجام نشد."
       echo -e "  ${U_B}بررسی کنید:${U_0}"
       echo -e "   • روی سرور دیگر «گیرنده» فعال باشد"
-      echo -e "   • تانل بالا باشد (منو → وضعیت تانل‌ها) و $ip با ping جواب بده"
+      if [[ $mode == path ]]; then
+        echo -e "   • پورت $SPEED_PORT بین دو سرور باز باشد (فایروال دیتاسنتر سرور گیرنده)"
+      else
+        echo -e "   • تانل بالا باشد (منو → وضعیت تانل‌ها) و $ip با ping جواب بده"
+      fi
     fi
     ui_pause
   fi
