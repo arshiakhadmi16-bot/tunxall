@@ -8,48 +8,40 @@ No obfuscation and no traffic disguising — these are plain, standard transport
 
 ---
 
-## ⚡ One-command install (on both servers)
+## 🚀 شروع سریع — فقط ۲ قدم
+
+### قدم ۱ — روی سرور اول (همون سروری که کاربرها بهش وصل می‌شن)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/arshiakhadmi16-bot/tunxall/main/install.sh | sudo bash
 ```
 
-This installs three global commands: `netcheck`, `abtunnel`, `wg-tunnel`.
+منو خودش باز می‌شه. گزینه‌ی **`[1] ساخت تانل جدید`** رو بزن و برای سؤال‌ها فقط **Enter** بزن (پیش‌فرض‌ها مناسب‌ان).
+آخرش یه **توکن** نشون می‌ده؛ کپی‌اش کن.
 
-### ساده‌ترین راه (منوی جدید)
+### قدم ۲ — روی سرور دوم
 
-بعد از نصب فقط بزن:
+همون دستور نصب رو بزن، بعد گزینه‌ی **`[2] وصل شدن با توکن`** و توکن رو **Paste** کن. تمام! ✅
 
-```bash
-sudo abtunnel
+```
+   [1]  ساخت تانل جدید      روی سرور اول — یک توکن می‌دهد
+   [2]  وصل شدن با توکن     روی سرور دوم — توکن را Paste کنید
+   [3]  وضعیت تانل‌ها
+   [4]  نمایش دوباره توکن
+   [5]  حذف تانل
+   [6]  تنظیمات پیشرفته
 ```
 
-منو این‌طور پیش می‌رود (برای افراد غیر فنی):
+- هر وقت خواستی منو رو باز کنی: `sudo abtunnel`
+- نیازی به نصب Go یا چیز دیگه‌ای نیست؛ همه‌چیز خودکار نصب می‌شه.
+- اگه فایروال `ufw` یا `firewalld` روشن باشه، پورت‌ها خودکار باز می‌شن. (فایروال دیتاسنتر رو خودت باید باز کنی.)
+- تانل‌ها با ریبوت یا قطعی اینترنت **خودشون دوباره وصل می‌شن**.
+- انواع اتصال: Backhaul TCP (پیشنهادی)، gRPC، gRPC+TLS، WebSocket، OpenVPN — و در «تنظیمات پیشرفته»: GRE، IPIP، WireGuard، SSH، Stunnel، IPsec و …
 
-1. **نقش این سرور** → سرور یا کلاینت  
-2. **IP سرور مقابل** را وارد کن  
-3. **خودکار** یا **دستی** را انتخاب کن  
-
-**حالت خودکار:**
-- سمت سرور: چند تانل را آماده می‌کند (Backhaul → OpenVPN → GRE → IPIP)
-- سمت کلاینت: به ترتیب امتحان می‌کند؛ اگر وصل نشد **۳ دقیقه** صبر و تانل بعدی را تست می‌کند تا یکی وصل شود
-
-**حالت دستی:** خودت پروتکل را انتخاب می‌کنی.
-
----
-
-### ساده‌ترین راه (منوی راهنما)
-
-بعد از نصب، منو **خودکار باز می‌شه** (هر وقت هم خواستی: `sudo abtunnel`).
-
-گزینه‌ی **۱) Set up a tunnel (guided)** و بعد به‌ترتیب ازت می‌پرسه:
-1. این سرور **SERVER** (IP عمومی) ئه یا **CLIENT**؟
-2. تانل روی **IPv4** یا **IPv6**؟
-3. کدوم **پروتکل**؟ (openvpn / wireguard / stunnel / ssh / ipsec / gre / ipip / sit / gre6 / ip6ip6)
-
-بعد تانل رو می‌زنه و نتیجه (موفق/ناموفق) رو می‌گه. **اگه وصل نشد، برمی‌گرده به منوی اصلی** تا دوباره یا یه پروتکل دیگه رو انتخاب کنی.
-
-ساده‌ترین مسیر برای OpenVPN: روی SERVER یه **توکن** چاپ می‌شه؛ روی CLIENT همون توکن رو **Paste** می‌کنی (بدون scp/رمز/فلگ).
+بدون منو هم می‌شه:
+```bash
+sudo abtunnel connect <TOKEN>
+```
 
 ---
 
@@ -58,7 +50,7 @@ sudo abtunnel
 | Command | Purpose |
 |--------|---------|
 | `netcheck`  | Measure which TCP/UDP ports, ICMP, MTU, throughput and connection stability pass between A and B. Measurement only. |
-| `abtunnel`  | Bring up one of three standard tunnels you choose from a menu: **stunnel (TLS)**, **ssh**, or **ipsec**. |
+| `abtunnel`  | Friendly menu to create a tunnel (token-based, 2 steps) — backhaul, openvpn, gre, ipip, wireguard, ssh, stunnel, ipsec, … |
 | `wg-tunnel` | A standard WireGuard link, if you prefer that transport. |
 
 All tunnels run under `systemd` with `Restart=always`, so a single transport

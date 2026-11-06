@@ -20,23 +20,102 @@ check_transport() { [[ $1 =~ ^(tcp|tcpmux|ws|wss|grpc|grpcs)$ ]] || die "transpo
 check_addr()      { [[ $1 =~ ^[A-Za-z0-9.:\[\]-]+$ ]] || die "invalid address: $1"; }
 
 # ---------- ensure binary ----------
-ensure_backhaul_bin() {
-  if [[ -x $BH_BIN ]]; then
-    return 0
+TUNXALL_REPO="${TUNXALL_REPO:-arshiakhadmi16-bot/tunxall}"
+GO_MIN_MINOR=22   # backhaul needs Go >= 1.22 when built from source
+
+bh_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)   echo amd64;;
+    aarch64|arm64)  echo arm64;;
+    armv7*|armv6*)  echo arm;;
+    i?86)           echo 386;;
+    *)              echo "";;
+  esac
+}
+
+# 1) Prebuilt binary from the GitHub release (no Go needed).
+bh_download_release() {
+  local arch url tmp sums want got
+  arch=$(bh_arch); [[ -n $arch ]] || return 1
+  url="https://github.com/$TUNXALL_REPO/releases/download/backhaul-latest"
+  tmp=$(mktemp -d)
+  if curl -fsSL --retry 2 --max-time 120 -o "$tmp/backhaul" "$url/backhaul-linux-$arch" \
+     && curl -fsSL --retry 2 --max-time 30 -o "$tmp/SHA256SUMS" "$url/SHA256SUMS"; then
+    want=$(awk -v f="backhaul-linux-$arch" '$2==f {print $1}' "$tmp/SHA256SUMS")
+    got=$(sha256sum "$tmp/backhaul" | awk '{print $1}')
+    if [[ -n $want && $want == "$got" ]]; then
+      install -m 755 "$tmp/backhaul" "$BH_BIN"
+      rm -rf "$tmp"
+      return 0
+    fi
+    warn "checksum mismatch for the downloaded backhaul binary — ignoring it"
   fi
-  mkdir -p "$BH_DIR"
-  # Try to build from bundled source (next to this script, or where install.sh put it)
+  rm -rf "$tmp"
+  return 1
+}
+
+go_ok() { # is a usable Go (>= 1.GO_MIN_MINOR) on PATH?
+  command -v go >/dev/null 2>&1 || return 1
+  local v; v=$(go env GOVERSION 2>/dev/null | sed -E 's/^go1\.([0-9]+).*/\1/')
+  [[ $v =~ ^[0-9]+$ ]] && (( v >= GO_MIN_MINOR ))
+}
+
+# 2) Fallback: install a private Go toolchain (official tarball, or a mirror when
+#    dl.google.com is unreachable) into /usr/local/lib/tunxall/go.
+bh_install_go() {
+  local arch ver file want got url tmp
+  arch=$(bh_arch); [[ -n $arch ]] || return 1
+  [[ $arch == arm ]] && arch=armv6l
+  ver=$(curl -fsSL --max-time 15 "https://go.dev/VERSION?m=text" 2>/dev/null | head -1)
+  [[ $ver =~ ^go1\.[0-9]+ ]] || ver=go1.23.4
+  file="$ver.linux-$arch.tar.gz"
+  want=$(curl -fsSL --max-time 15 "https://go.dev/dl/?mode=json" 2>/dev/null \
+         | tr ',' '\n' | grep -A8 "\"filename\": *\"$file\"" | sed -nE 's/.*"sha256": *"([0-9a-f]{64})".*/\1/p' | head -1)
+  tmp=$(mktemp -d)
+  for url in "https://go.dev/dl/$file" "https://mirrors.aliyun.com/golang/$file" "https://golang.google.cn/dl/$file"; do
+    curl -fsSL --retry 2 --max-time 600 -o "$tmp/go.tgz" "$url" 2>/dev/null || continue
+    got=$(sha256sum "$tmp/go.tgz" | awk '{print $1}')
+    # Without the official checksum, only trust the official download (over TLS).
+    if [[ $want == "$got" || ( -z $want && $url == https://go.dev/* ) ]]; then
+      rm -rf /usr/local/lib/tunxall/go && mkdir -p /usr/local/lib/tunxall
+      tar -xzf "$tmp/go.tgz" -C /usr/local/lib/tunxall && rm -rf "$tmp"
+      export PATH="/usr/local/lib/tunxall/go/bin:$PATH"
+      return 0
+    fi
+  done
+  rm -rf "$tmp"
+  return 1
+}
+
+bh_build_from_source() {
   local src
   for src in "$SCRIPT_DIR/backhaul" /opt/tunxall/backhaul; do
     [[ -f $src/go.mod ]] || continue
-    command -v go >/dev/null 2>&1 || die "Go is needed to build backhaul (Go >= 1.22): https://go.dev/doc/install"
-    log "Building backhaul from source ($src)..."
-    (cd "$src" && go build -o "$BH_BIN" .) || die "go build failed (Go >= 1.22 required; you have: $(go version 2>/dev/null))"
+    [[ -x /usr/local/lib/tunxall/go/bin/go ]] && export PATH="/usr/local/lib/tunxall/go/bin:$PATH"
+    if ! go_ok; then
+      log "Installing Go toolchain (one time, ~70MB)..."
+      bh_install_go || return 1
+    fi
+    log "Building backhaul from source..."
+    (cd "$src" && GOFLAGS=-mod=mod GOPROXY="https://proxy.golang.org,https://goproxy.cn,direct" \
+       CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$BH_BIN" .) || return 1
     chmod +x "$BH_BIN"
-    log "Backhaul binary ready: $BH_BIN"
     return 0
   done
-  die "backhaul binary not found and no source to build it (re-run install.sh, or place the binary at $BH_BIN)"
+  return 1
+}
+
+ensure_backhaul_bin() {
+  [[ -x $BH_BIN ]] && return 0
+  mkdir -p "$BH_DIR"
+  log "Getting the backhaul program..."
+  if bh_download_release; then
+    log "Backhaul ready (prebuilt)."
+  elif bh_build_from_source; then
+    log "Backhaul ready (built from source)."
+  else
+    die "could not download or build backhaul — check this server's internet access and try again"
+  fi
 }
 
 # ---------- server ----------
@@ -110,18 +189,21 @@ EOF
   systemctl daemon-reload
   systemctl enable abtunnel-backhaul.service >/dev/null 2>&1 || true
   systemctl restart abtunnel-backhaul.service   # pick up the new config even if it was already running
+  # Connection token for the other server (also saved so the menu can show it again)
+  local pub="${PUBLIC_IP:-}"
+  [[ -n $pub ]] || pub=$(curl -4 -fs --max-time 4 ifconfig.me 2>/dev/null || curl -4 -fs --max-time 4 icanhazip.com 2>/dev/null || echo "YOUR_PUBLIC_IP")
+  local client_token
+  client_token=$(printf 'T=backhaul;PEER=%s;PORT=%s;TOKEN=%s;TRANSPORT=%s' "$pub" "$bind_port" "$token" "$transport" | base64 | tr -d '\n')
+  printf '%s\n' "$client_token" > "$BH_DIR/connect.token"; chmod 600 "$BH_DIR/connect.token"
+
+  [[ -n ${BH_QUIET:-} ]] && return 0
   log "Backhaul SERVER up on 0.0.0.0:${bind_port}  transport=${transport}"
   echo
   echo -e "${c_y}========== CLIENT TOKEN (copy this) ==========${c_0}"
-  # Token format for easy client setup
-  local pub
-  pub=$(curl -4 -s --max-time 3 ifconfig.me 2>/dev/null || curl -4 -s --max-time 3 icanhazip.com 2>/dev/null || echo "YOUR_PUBLIC_IP")
-  local client_token
-  client_token=$(printf 'T=backhaul;PEER=%s;PORT=%s;TOKEN=%s;TRANSPORT=%s' "$pub" "$bind_port" "$token" "$transport" | base64 -w0 2>/dev/null || printf 'T=backhaul;PEER=%s;PORT=%s;TOKEN=%s;TRANSPORT=%s' "$pub" "$bind_port" "$token" "$transport" | base64)
   echo "$client_token"
   echo -e "${c_y}================================================${c_0}"
   echo
-  log "Or configure client manually with token: ${token}"
+  log "On the other server:  sudo abtunnel connect <token>"
   log "Server config: $BH_DIR/server.toml"
 }
 
@@ -208,6 +290,7 @@ EOF
   systemctl daemon-reload
   systemctl enable abtunnel-backhaul.service >/dev/null 2>&1 || true
   systemctl restart abtunnel-backhaul.service   # pick up the new config even if it was already running
+  [[ -n ${BH_QUIET:-} ]] && return 0
   log "Backhaul CLIENT started"
   log "Config: $BH_DIR/client.toml"
   if [[ ${#addrs[@]} -gt 1 ]]; then
