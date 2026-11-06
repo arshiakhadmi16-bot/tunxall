@@ -371,6 +371,8 @@ EOF
   chmod +x $DIR/$ifn-up.sh $DIR/$ifn-down.sh
   mkoneshot "abtunnel-$kind" "$DIR/$ifn-up.sh" "$DIR/$ifn-down.sh"
   enable_forwarding
+  # Auto-forward requested ports into the tunnel toward the peer's inner IP.
+  [[ $role == server && -n ${FWD_PORTS:-} ]] && create_forwards "$peeraddr" "${FWD_PROTO:-tcp}" "$FWD_PORTS" "${FWD_SVC:-}" || true
   log "$kind tunnel up: this side ${myaddr%/*} <-> peer $peeraddr (iface $ifn, endpoints over IPv$fam, MTU $mtu)"
   log "Forward a service into the tunnel:  sudo bash abtunnel.sh forward --proto tcp --in-port <PORT> --to $peeraddr --to-port <PORT>"
   log "Test:  ping$([[ $inner == 6 ]] && echo ' -6') -c3 $peeraddr"
@@ -407,6 +409,8 @@ persist-tun
 EOF
   mkunit abtunnel-openvpn "$(command -v openvpn) --config $DIR/ovpn.conf"
   enable_forwarding
+  # Auto-forward requested ports into the tunnel toward the peer (10.30.0.2).
+  [[ -n ${FWD_PORTS:-} ]] && create_forwards 10.30.0.2 "${FWD_PROTO:-tcp}" "$FWD_PORTS" "${FWD_SVC:-}" || true
   local pub token
   pub="${PUBLIC_IP:-}"; [[ -n $pub ]] || pub=$(detect_pubip)
   token=$(printf 'T=openvpn;PEER=%s;PORT=%s;KEY=%s' "$pub" "$OVPN_PORT" "$(base64 -w0 $DIR/ovpn.key)" | base64 -w0)
@@ -503,6 +507,26 @@ EOF
 # ----------------------------------------------------- port forwarding
 # DNAT a port on THIS server into the tunnel toward the peer's tunnel IP.
 # Example: expose a DB that runs on the peer, reachable on this server's :3306.
+# create_forwards <peer_inner_ip> <proto> <ports_csv> [svc_port]
+# Auto-DNAT each public port on this server into the tunnel toward the peer's
+# inner IP. Used so interface tunnels (openvpn/gre/ipip/…) forward traffic
+# automatically, the same way backhaul's port mapping does.
+create_forwards() {
+  local peer="$1" proto="${2:-tcp}" ports="$3" svc="${4:-}"
+  [[ -n $peer && -n $ports ]] || return 0
+  local o_proto=$PROTO o_in=$IN_PORT o_to=$TO o_tp=$TO_PORT
+  local p tp arr ok=0
+  IFS=',' read -ra arr <<< "$ports"
+  for p in "${arr[@]}"; do
+    p=$(echo "$p" | xargs); [[ $p =~ ^[0-9]{1,5}$ ]] || continue
+    tp="$svc"; [[ -z $tp ]] && tp="$p"
+    PROTO="$proto"; IN_PORT="$p"; TO="$peer"; TO_PORT="$tp"
+    cmd_forward >/dev/null 2>&1 && ok=1
+  done
+  PROTO=$o_proto; IN_PORT=$o_in; TO=$o_to; TO_PORT=$o_tp
+  [[ $ok == 1 ]]
+}
+
 cmd_forward() {
   need_root; apt_install iptables
   [[ -n $IN_PORT ]] || die "need --in-port <port to accept on this server>"
@@ -930,7 +954,10 @@ manual_setup() {
         ;;
       gre|ipip)
         read -rp "PSK مشترک (خالی = بدون رمز): " PSK
+        read -rp "پورت‌هایی که خودکار به داخل تانل فوروارد شوند (مثلاً 80,443؛ خالی = هیچ): " FWD_PORTS
         ( iface_tunnel_setup "$proto" server ) || warn "ناموفق"
+        [[ -n ${FWD_PORTS:-} ]] && log "فوروارد خودکار برای پورت‌های: $FWD_PORTS"
+        FWD_PORTS=""
         ;;
       ssh)
         read -rp "کلید عمومی کلاینت (خالی = بعداً): " PUBKEY
@@ -1228,6 +1255,14 @@ easy_server() {
     done
   else
     ask tport "پورت UDP برای OpenVPN" "1194" '^[0-9]{1,5}$' || return 0
+    echo
+    if confirm "یک سرویس از سرور دوم را خودکار روی این سرور در دسترس کنم؟"; then
+      ask users_ports "روی کدام پورت این سرور؟ (مثلاً 443 یا 80,443)" "443" '^[0-9]{1,5}(,[0-9]{1,5})*$' "مثل 443 یا 80,443 وارد کنید" || return 0
+      if [[ $users_ports =~ ^[0-9]+$ ]]; then
+        echo -e "  ${U_D}همان سرویس روی سرور دوم روی چه پورتی است؟ (اگر همان است Enter)${U_0}"
+        ask svc_port "پورت سرویس روی سرور دوم" "$users_ports" '^[0-9]{1,5}$' || return 0
+      fi
+    fi
   fi
 
   ui_step 3 3 "آدرس این سرور"
@@ -1246,10 +1281,13 @@ easy_server() {
     token_file=$DIR/backhaul/connect.token
     [[ $ok == 1 ]] && open_firewall tcp "$tport" ${users_ports//,/ }
   else
-    _mk() { BH_QUIET=1 PUBLIC_IP="$1" OVPN_PORT="$2" openvpn_server; }
-    spin "ساخت تانل OpenVPN" _mk "$pub" "$tport" && ok=1
+    _mk() { BH_QUIET=1 PUBLIC_IP="$1" OVPN_PORT="$2" FWD_PORTS="$3" FWD_SVC="$4" openvpn_server; }
+    spin "ساخت تانل OpenVPN" _mk "$pub" "$tport" "$users_ports" "$svc_port" && ok=1
     token_file=$DIR/ovpn-connect.token
-    [[ $ok == 1 ]] && open_firewall udp "$tport"
+    if [[ $ok == 1 ]]; then
+      open_firewall udp "$tport"
+      [[ -n $users_ports ]] && open_firewall tcp ${users_ports//,/ }
+    fi
   fi
 
   if [[ $ok == 1 && -s $token_file ]]; then
@@ -1260,6 +1298,12 @@ easy_server() {
     echo -e "   ۱) نصب:   ${U_CY}curl -fsSL https://raw.githubusercontent.com/${TUNXALL_REPO:-arshiakhadmi16-bot/tunxall}/main/install.sh | sudo bash${U_0}"
     echo -e "   ۲) در منو گزینه‌ی ${U_B}[2] وصل شدن با توکن${U_0} را بزنید و توکن را Paste کنید."
     echo -e "  ${U_D}(هر وقت خواستید از منوی اصلی «نمایش دوباره توکن» را بزنید.)${U_0}"
+    if [[ $kind == backhaul ]]; then
+      echo; ui_info "فوروارد پورت‌ها خودکار انجام شد — کاربرها به ${U_B}${users_ports}${U_0} این سرور وصل می‌شوند."
+    elif [[ $kind == openvpn && -n $users_ports ]]; then
+      echo; ui_info "پورت‌فوروارد خودکار ساخته شد: ${U_B}${users_ports}${U_0} → سرویس روی سرور دوم"
+      echo -e "  ${U_D}نکته: سرویس روی سرور دوم باید روی 0.0.0.0 گوش بده (نه فقط 127.0.0.1).${U_0}"
+    fi
   else
     echo; ui_err "${U_B}ساخت تانل ناموفق بود.${U_0}"
     ui_info "جزئیات خطا در بالا و در فایل $LOGFILE است."
