@@ -1519,6 +1519,99 @@ advanced_screen() {
 }
 
 # -------------------------------------------------------- main interactive menu
+# ---------------------------------------------------------------- speed test
+SPEED_PORT="${SPEED_PORT:-5201}"
+
+# iface_peer_ip <iface> — inner IP of the tunnel peer on a point-to-point iface.
+iface_peer_ip() {
+  local info; info=$(ip addr show dev "$1" 2>/dev/null) || return 0
+  local peer; peer=$(awk '{for(i=1;i<=NF;i++) if($i=="peer") print $(i+1)}' <<<"$info" | head -1)
+  if [[ -n $peer ]]; then echo "${peer%/*}"; return; fi
+  local my; my=$(awk '/inet6? /{print $2; exit}' <<<"$info"); my=${my%/*}
+  case "$my" in
+    *.1) echo "${my%.*}.2";; *.2) echo "${my%.*}.1";;
+    *::1) echo "${my%1}2";;  *::2) echo "${my%2}1";;
+  esac
+}
+# local inner IP of the first up tunnel iface (for binding the iperf server)
+speed_local_ip() {
+  local ifn
+  for ifn in tun0 gre1 ipip1 sit1 gre6 ip6t1 wg0; do
+    ip link show "$ifn" up >/dev/null 2>&1 || continue
+    ip addr show dev "$ifn" 2>/dev/null | awk '/inet6? /{print $2; exit}' | cut -d/ -f1 && return
+  done
+}
+# best-guess peer inner IP across known tunnel ifaces
+speed_peer_ip() {
+  local ifn p
+  for ifn in tun0 gre1 ipip1 sit1 gre6 ip6t1 wg0; do
+    ip link show "$ifn" up >/dev/null 2>&1 || continue
+    p=$(iface_peer_ip "$ifn"); [[ -n $p ]] && { echo "$p"; return; }
+  done
+}
+# parse the receiver Mbit/s from iperf3 -f m output (prefer the SUM line with -P)
+speed_parse() { awk '/receiver/{v=$(NF-2)} /SUM/&&/receiver/{s=$(NF-2)} END{print (s!="" ? s : v)}'; }
+
+speed_screen() {
+  ui_banner
+  ui_title "تست سرعت روی تانل"
+  echo -e "  ${U_D}سرعت واقعی داده بین دو سرور را از داخل تانل اندازه می‌گیرد (با iperf3).${U_0}"
+
+  local has_iface=""; has_iface=$(speed_peer_ip)
+  if [[ -z $has_iface ]]; then
+    ui_info "تانل اینترفیسی فعالی پیدا نشد (openvpn/gre/ipip/wireguard)."
+    echo -e "  ${U_D}برای Backhaul، سرعتِ روی تانل تقریباً برابر سرعت مسیر است؛ با «netcheck» مسیر را بسنجید:${U_0}"
+    echo -e "  ${U_CY}sudo netcheck server${U_0}   و روی سرور دیگر   ${U_CY}sudo netcheck probe --target <IP>${U_0}"
+    ui_pause; return 0
+  fi
+
+  echo
+  ui_opt 1 "گیرنده (این سرور منتظر بماند)" "روی یکی از دو سرور"
+  ui_opt 2 "فرستنده (شروع تست)"            "روی سرور دیگر"
+  ui_opt 0 "برگشت"
+  local c; choose c 2 || return 0
+  [[ $c == 0 ]] && return 0
+
+  if ! command -v iperf3 >/dev/null 2>&1; then
+    ui_info "در حال نصب iperf3..."
+    apt_install iperf3 || { ui_err "نصب iperf3 ناموفق بود"; ui_pause; return 0; }
+  fi
+
+  if [[ $c == 1 ]]; then
+    local bind; bind=$(speed_local_ip)
+    ui_ok "گیرنده آماده شد${bind:+ (روی $bind)} — پورت $SPEED_PORT"
+    echo -e "  ${U_D}حالا روی سرور دیگر «فرستنده» را اجرا کنید. بعد از پایان تست، همین‌جا Enter بزنید.${U_0}"
+    local pid
+    iperf3 -s ${bind:+-B "$bind"} -p "$SPEED_PORT" >>"$LOGFILE" 2>&1 &
+    pid=$!
+    read -rp "  ↵  Enter برای توقف گیرنده " _ || true
+    kill "$pid" 2>/dev/null || true
+    ui_ok "گیرنده متوقف شد."
+    ui_pause
+  else
+    local ip
+    ui_info "IP داخلی طرف مقابل روی تانل${has_iface:+ (پیشنهاد: $has_iface)}:"
+    ask ip "IP طرف مقابل" "$has_iface" '^[0-9A-Fa-f.:]+$' "یک IP معتبر وارد کنید" || return 0
+    echo; ui_info "در حال تست (چند ثانیه)... مطمئن شوید روی سرور دیگر «گیرنده» فعال است."
+    local p6=""; [[ $ip == *:* ]] && p6="-6"
+    local up down
+    up=$(iperf3 -c "$ip" $p6 -p "$SPEED_PORT" -t 8 -P 4 -f m 2>/dev/null | speed_parse)
+    down=$(iperf3 -c "$ip" $p6 -p "$SPEED_PORT" -t 8 -P 4 -f m -R 2>/dev/null | speed_parse)
+    echo; ui_line
+    if [[ -n $up || -n $down ]]; then
+      ui_ok "${U_B}نتیجه‌ی تست سرعت تانل:${U_0}"
+      echo -e "   ⬆️  ارسال (این سرور → طرف مقابل):   ${U_B}${up:-?} Mbit/s${U_0}"
+      echo -e "   ⬇️  دریافت (طرف مقابل → این سرور):  ${U_B}${down:-?} Mbit/s${U_0}"
+    else
+      ui_err "تست انجام نشد."
+      echo -e "  ${U_B}بررسی کنید:${U_0}"
+      echo -e "   • روی سرور دیگر «گیرنده» فعال باشد"
+      echo -e "   • تانل بالا باشد (منو → وضعیت تانل‌ها) و $ip با ping جواب بده"
+    fi
+    ui_pause
+  fi
+}
+
 wizard() {
   [[ $EUID -eq 0 ]] || die "لطفاً با sudo اجرا کنید:  sudo abtunnel"
   touch "$LOGFILE" 2>/dev/null || LOGFILE=/tmp/abtunnel.log
@@ -1536,10 +1629,11 @@ wizard() {
     ui_opt 4 "نمایش دوباره توکن"
     ui_opt 5 "حذف تانل"
     ui_opt 6 "سوئیچ خودکار (Failover)"  "اگر قطع شد → تانل بعدی"
-    ui_opt 7 "تنظیمات پیشرفته"
+    ui_opt 7 "تست سرعت تانل"            "سرعت واقعی بین دو سرور روی تانل"
+    ui_opt 8 "تنظیمات پیشرفته"
     ui_opt 0 "خروج"
     ui_line
-    local c; choose c 7 || exit 0
+    local c; choose c 8 || exit 0
     case "$c" in
       1) easy_server;;
       2) easy_client;;
@@ -1547,7 +1641,8 @@ wizard() {
       4) token_screen;;
       5) remove_screen;;
       6) failover_screen;;
-      7) advanced_screen;;
+      7) speed_screen;;
+      8) advanced_screen;;
       0) ui_clear; exit 0;;
     esac
   done
@@ -1604,6 +1699,7 @@ main() {
     down) cmd_down "${1:-}";;
     health) parse_args "$@"; health_install;;
     forward) parse_args "$@"; cmd_forward;;
+    speed)   need_root; speed_screen;;
     stunnel) local role="${1:-}"; shift || true; parse_args "$@"; if [[ $role == server ]]; then stunnel_server; else stunnel_client; fi;;
     ssh)     local role="${1:-}"; shift || true; parse_args "$@"; if [[ $role == server ]]; then ssh_server; else ssh_client; fi;;
     ipsec)   local role="${1:-}"; shift || true; parse_args "$@"; ipsec_setup "$role";;
@@ -1614,7 +1710,7 @@ main() {
     ip6ip6)  local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup ip6ip6 "$role";;
     openvpn) local role="${1:-}"; shift || true; parse_args "$@"; if [[ $role == server ]]; then openvpn_server; else openvpn_client; fi;;
     backhaul) local role="${1:-}"; shift || true; parse_args "$@"; if [[ $role == server ]]; then backhaul_server; else backhaul_client; fi;;
-    *) echo "Usage: $0 {menu|connect <token>|advanced|stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn|backhaul|forward|health|status|down|uninstall} ..."; echo "Easiest:  sudo $0   (opens the menu)"; exit 1;;
+    *) echo "Usage: $0 {menu|connect <token>|advanced|stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn|backhaul|forward|speed|health|status|down|uninstall} ..."; echo "Easiest:  sudo $0   (opens the menu)"; exit 1;;
   esac
 }
 main "$@"
