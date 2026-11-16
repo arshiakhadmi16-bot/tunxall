@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/musix/backhaul-rewrite/internal/handlers"
-	"github.com/musix/backhaul-rewrite/internal/network"
+	netx "github.com/musix/backhaul-rewrite/internal/network"
 	"github.com/musix/backhaul-rewrite/internal/utils"
 	"github.com/musix/backhaul-rewrite/internal/wsconn"
 
@@ -22,14 +22,16 @@ import (
 type WsClientConfig struct {
 	RemoteAddr     string
 	Token          string
+	Obfuscate      bool
 	KeepAlive      time.Duration
 	RetryInterval  time.Duration
 	DialTimeOut    time.Duration
 	ConnPoolSize   int
 	Nodelay        bool
 	AggressivePool bool
-	Mode           string // "ws" or "wss"
+	Mode           string // "ws", "wss", or "https"
 	EdgeIP         string
+	Proxy          string
 }
 
 type WsClient struct {
@@ -60,19 +62,26 @@ func (c *WsClient) Stop() {
 
 // DialWS opens a websocket to remoteAddr ("host:port"). If edgeIP is set, the TCP
 // connection goes to edgeIP (e.g. a CDN edge) while Host/SNI stay remoteAddr.
-func DialWS(ctx context.Context, mode, remoteAddr, edgeIP string, timeout time.Duration) (net.Conn, error) {
+func DialWS(ctx context.Context, mode, remoteAddr, edgeIP, token, proxyURL string, timeout time.Duration) (net.Conn, error) {
 	scheme := "ws"
-	if mode == "wss" {
+	if mode == "wss" || mode == "https" {
 		scheme = "wss"
 	}
-	u := url.URL{Scheme: scheme, Host: remoteAddr, Path: "/"}
+	// /tunnel path + token header: looks like a normal API stream to DPI; decoy page on /
+	u := url.URL{Scheme: scheme, Host: remoteAddr, Path: "/tunnel"}
 
 	nd := &net.Dialer{Timeout: timeout, KeepAlive: 15 * time.Second}
+	netDial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		if proxyURL != "" {
+			return netx.DialTCP(ctx, address, proxyURL, timeout, 15*time.Second, true)
+		}
+		return nd.DialContext(ctx, network, address)
+	}
 	dialer := websocket.Dialer{
 		HandshakeTimeout: timeout,
 		// Self-signed certificates are the norm for this tool; the token authenticates the server.
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		NetDialContext:  nd.DialContext,
+		NetDialContext:  netDial,
 	}
 	if edgeIP != "" {
 		_, port, err := net.SplitHostPort(remoteAddr)
@@ -88,7 +97,12 @@ func DialWS(ctx context.Context, mode, remoteAddr, edgeIP string, timeout time.D
 		}
 	}
 
-	wsConn, _, err := dialer.DialContext(ctx, u.String(), http.Header{})
+	hdr := http.Header{}
+	if token != "" {
+		hdr.Set("X-Token", token)
+		hdr.Set("Authorization", "Bearer "+token)
+	}
+	wsConn, _, err := dialer.DialContext(ctx, u.String(), hdr)
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +110,7 @@ func DialWS(ctx context.Context, mode, remoteAddr, edgeIP string, timeout time.D
 }
 
 func (c *WsClient) dialWS(ctx context.Context) (net.Conn, error) {
-	return DialWS(ctx, c.config.Mode, c.config.RemoteAddr, c.config.EdgeIP, c.config.DialTimeOut)
+	return DialWS(ctx, c.config.Mode, c.config.RemoteAddr, c.config.EdgeIP, c.config.Token, c.config.Proxy, c.config.DialTimeOut)
 }
 
 func (c *WsClient) dialControl(ctx context.Context) (net.Conn, error) {
@@ -160,17 +174,17 @@ func (c *WsClient) tunnelDialer(sess *clientSession) {
 		conn.Close()
 		return
 	}
-	_, resolved, err := network.ResolveRemoteAddr(remoteAddr)
+	_, resolved, err := netx.ResolveRemoteAddr(remoteAddr)
 	if err != nil {
 		c.logger.Warnf("bad target address %q: %v", remoteAddr, err)
 		conn.Close()
 		return
 	}
-	localConn, err := network.TcpDialer(c.ctx, resolved, "", c.config.DialTimeOut, c.config.KeepAlive, true, 1, 0, 0, 0)
+	localConn, err := netx.TcpDialer(c.ctx, resolved, "", c.config.DialTimeOut, c.config.KeepAlive, true, 1, 0, 0, 0)
 	if err != nil {
 		c.logger.Errorf("local dial to %s failed: %v", resolved, err)
 		conn.Close()
 		return
 	}
-	handlers.TCPConnectionHandler(c.ctx, false, conn, localConn, c.logger, 0, false)
+	handlers.TCPConnectionHandler(c.ctx, false, localConn, conn, c.logger, 0, false, c.config.Obfuscate)
 }

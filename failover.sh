@@ -1,23 +1,14 @@
 #!/usr/bin/env bash
-# failover.sh — Intelligent multi-tunnel failover + health watchdog for tunxall
-#
-# Monitors the active tunnel; on sustained failure it switches to the next
-# tunnel that is actually installed AND comes up healthy. It never tears down a
-# working tunnel to chase one that isn't set up, so enabling failover can't take
-# a healthy link down.
-set -uo pipefail
+# failover.sh — Intelligent multi-tunnel failover (TCP health, no ICMP required)
+set -euo pipefail
 
 DIR=/etc/abtunnel
 STATE="$DIR/failover"
-LIST="$STATE/tunnels.list"          # ordered list of tunnel kinds
-ACTIVE="$STATE/active"              # currently active kind
+LIST="$STATE/tunnels.list"
+ACTIVE="$STATE/active"
 LOG="${LOGFILE:-/var/log/abtunnel-failover.log}"
-CHECK_INTERVAL="${CHECK_INTERVAL:-20}"   # seconds between health checks
-FAIL_THRESHOLD="${FAIL_THRESHOLD:-3}"    # consecutive failures before switch
-SWITCH_PROBES="${SWITCH_PROBES:-5}"      # health retries after starting a candidate
-
-# every tunnel kind failover understands, in default priority order
-ALL_KINDS=(backhaul openvpn gre ipip sit gre6 ip6ip6 wireguard ssh stunnel)
+CHECK_INTERVAL="${CHECK_INTERVAL:-20}"
+FAIL_THRESHOLD="${FAIL_THRESHOLD:-3}"
 
 c_g="\e[32m"; c_r="\e[31m"; c_y="\e[33m"; c_c="\e[36m"; c_0="\e[0m"
 log()  { echo -e "$(date '+%F %T') ${c_g}[+]${c_0} $*" | tee -a "$LOG"; }
@@ -25,212 +16,357 @@ warn() { echo -e "$(date '+%F %T') ${c_y}[!]${c_0} $*" | tee -a "$LOG"; }
 err()  { echo -e "$(date '+%F %T') ${c_r}[x]${c_0} $*" | tee -a "$LOG"; }
 
 need_root() { [[ $EUID -eq 0 ]] || { echo "need root"; exit 1; }; }
-
-mkdir -p "$STATE" 2>/dev/null || true
+mkdir -p "$STATE"
 touch "$LOG" 2>/dev/null || LOG=/tmp/abtunnel-failover.log
 
-# ---------- unit / install mapping ----------
+# Canonical kind → systemd unit (one unit per real tunnel stack)
 unit_for() {
   case "$1" in
-    backhaul)     echo abtunnel-backhaul;;
-    openvpn)      echo abtunnel-openvpn;;
-    gre)          echo abtunnel-gre;;
-    ipip)         echo abtunnel-ipip;;
-    sit)          echo abtunnel-sit;;
-    gre6)         echo abtunnel-gre6;;
-    ip6ip6)       echo abtunnel-ip6ip6;;
-    wireguard|wg) echo wg-quick@wg0;;
-    ssh)          echo abtunnel-ssh;;
-    stunnel)      echo abtunnel-stunnel;;
-    *)            echo "abtunnel-$1";;
+    tunlink|noping|https) echo abtunnel-tunlink;;
+    openvpn)              echo abtunnel-openvpn;;
+    gre)                  echo abtunnel-gre;;
+    ipip)                 echo abtunnel-ipip;;
+    wireguard|wg)         echo wg-quick@wg0;;
+    ssh)                  echo abtunnel-ssh;;
+    stunnel)              echo abtunnel-stunnel;;
+    ipsec)                echo strongswan-starter;;
+    *)                    echo "abtunnel-$1";;
   esac
 }
 
-# is_installed <kind> — true only if this tunnel is actually configured on this
-# host (its systemd unit / config exists). Used so failover never switches to a
-# tunnel that was never set up.
-is_installed() {
-  local kind="$1" unit; unit=$(unit_for "$kind")
-  case "$kind" in
-    wireguard|wg) [[ -f /etc/wireguard/wg0.conf ]];;
-    *)            [[ -f "/etc/systemd/system/$unit.service" ]];;
+# Collapse aliases that share the same unit so the list has unique targets
+canonical_kind() {
+  case "$1" in
+    noping|https|tunlink) echo tunlink;;
+    wireguard|wg)         echo wireguard;;
+    *)                    echo "$1";;
   esac
 }
 
 peer_ip_for() {
-  case "$1" in
-    openvpn)      echo 10.30.0.1;;
-    gre)          echo 10.20.0.1;;
-    ipip)         echo 10.40.0.1;;
-    sit)          echo fd60::1;;
-    gre6)         echo fd20::1;;
-    ip6ip6)       echo fd40::1;;
-    wireguard|wg) echo 10.10.0.1;;
-    *)            echo "";;
+  case "$(canonical_kind "$1")" in
+    openvpn)   echo 10.30.0.1;;
+    gre)       echo 10.20.0.1;;
+    ipip)      echo 10.40.0.1;;
+    wireguard) echo 10.10.0.1;;
+    *)         echo "";;
   esac
 }
 
-is_healthy() {
-  local kind="$1" unit; unit=$(unit_for "$kind")
-  systemctl is-active --quiet "$unit" 2>/dev/null || return 1
-  # For interface tunnels, ping the peer's inner IP (ICMP inside the tunnel is
-  # virtually always allowed, even when it's blocked on the public path).
-  local tip; tip=$(peer_ip_for "$kind")
-  if [[ -n $tip ]]; then
-    local p6=""; [[ $tip == *:* ]] && p6="-6"
-    ping $p6 -c1 -W2 "$tip" >/dev/null 2>&1 || return 1
-  fi
-  return 0
+tcp_open() {
+  local host="$1" port="$2" timeout="${3:-3}"
+  timeout "$timeout" bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null
 }
 
-start_tunnel() { systemctl start "$(unit_for "$1")" 2>/dev/null || true; }
-stop_tunnel()  { systemctl stop  "$(unit_for "$1")" 2>/dev/null || true; }
+tunlink_remote_port() {
+  local cfg line
+  cfg="$DIR/tunlink/client.toml"
+  if [[ -f $cfg ]]; then
+    line=$(grep -E 'remote_addr\s*=' "$cfg" 2>/dev/null | head -1 || true)
+    if [[ $line =~ :([0-9]+)\" ]]; then echo "${BASH_REMATCH[1]}"; return; fi
+    line=$(grep -oE '"[^"]+:[0-9]+"' "$cfg" 2>/dev/null | head -1 || true)
+    if [[ $line =~ :([0-9]+)\" ]]; then echo "${BASH_REMATCH[1]}"; return; fi
+  fi
+  cfg="$DIR/tunlink/server.toml"
+  if [[ -f $cfg ]]; then
+    line=$(grep -E 'bind_addr\s*=' "$cfg" 2>/dev/null | head -1 || true)
+    if [[ $line =~ :([0-9]+)\" ]]; then echo "${BASH_REMATCH[1]}"; return; fi
+  fi
+  echo ""
+}
 
-# wait until a freshly started tunnel is healthy, or give up
-wait_healthy() {
-  local kind="$1" i
-  for (( i = 0; i < SWITCH_PROBES; i++ )); do
-    sleep 2
-    is_healthy "$kind" && return 0
-  done
+tunlink_peer_host() {
+  local cfg="$DIR/tunlink/client.toml" line
+  [[ -f $cfg ]] || { echo ""; return; }
+  line=$(grep -E 'remote_addr\s*=' "$cfg" 2>/dev/null | head -1 || true)
+  if [[ $line =~ \"([^:\"]+): ]]; then echo "${BASH_REMATCH[1]}"; return; fi
+  line=$(grep -oE '"[^"]+:[0-9]+"' "$cfg" 2>/dev/null | head -1 | tr -d '"' || true)
+  echo "${line%%:*}"
+}
+
+# Strict health for tunlink: unit UP + (recent control channel OR working TCP to peer)
+# Soft "no errors in log" alone is NOT enough anymore.
+is_healthy_tunlink() {
+  local unit="abtunnel-tunlink"
+  systemctl is-active --quiet "$unit" 2>/dev/null || return 1
+
+  # Hard fail on recent critical errors
+  if journalctl -u "$unit" --since "90 sec ago" --no-pager 2>/dev/null \
+      | grep -Eqi 'failed to (dial|connect|handshake)|connection refused|i/o timeout|no such host|authentication failed|invalid token'; then
+    return 1
+  fi
+
+  # Strong positive: control channel established recently
+  if journalctl -u "$unit" --since "3 min ago" --no-pager 2>/dev/null \
+      | grep -Eqi 'control channel established'; then
+    return 0
+  fi
+
+  # Client side: TCP reachability to peer tunnel port
+  local host port
+  host=$(tunlink_peer_host)
+  port=$(tunlink_remote_port)
+  if [[ -n $host && -n $port ]]; then
+    if tcp_open "$host" "$port" 3; then
+      # TCP open is necessary but not sufficient alone — require either
+      # control-channel evidence in last 10 min OR service active > 30s without errors
+      if journalctl -u "$unit" --since "10 min ago" --no-pager 2>/dev/null \
+          | grep -Eqi 'control channel established|session|Connected'; then
+        return 0
+      fi
+      # If just restarted, give a brief grace only when ActiveEnterTimestamp is fresh
+      local active_sec
+      active_sec=$(systemctl show -p ActiveEnterTimestamp --value "$unit" 2>/dev/null || true)
+      if [[ -n $active_sec && $active_sec != "n/a" ]]; then
+        local epoch now age
+        epoch=$(date -d "$active_sec" +%s 2>/dev/null || echo 0)
+        now=$(date +%s)
+        age=$((now - epoch))
+        # grace window 45s after start while TCP works
+        (( age < 45 )) && return 0
+      fi
+      return 1
+    fi
+    return 1
+  fi
+
+  # Server side (no client.toml peer): require recent control-channel OR listener evidence
+  if [[ -f $DIR/tunlink/server.toml ]]; then
+    if journalctl -u "$unit" --since "10 min ago" --no-pager 2>/dev/null \
+        | grep -Eqi 'control channel established|server starting|listening|WebSocket server|TCP server'; then
+      return 0
+    fi
+    # listener port open locally?
+    port=$(tunlink_remote_port)
+    if [[ -n $port ]] && tcp_open "127.0.0.1" "$port" 1; then
+      return 0
+    fi
+    return 1
+  fi
+
   return 1
 }
 
-# ---------- list management ----------
-TUNNELS=()
+is_healthy() {
+  local kind raw
+  raw="$1"
+  kind=$(canonical_kind "$raw")
+  local unit; unit=$(unit_for "$kind")
+
+  systemctl is-active --quiet "$unit" 2>/dev/null || return 1
+
+  case "$kind" in
+    tunlink)
+      is_healthy_tunlink
+      return $?
+      ;;
+    ssh|stunnel)
+      return 0
+      ;;
+    openvpn|gre|ipip|wireguard)
+      local tip; tip=$(peer_ip_for "$kind")
+      [[ -z $tip ]] && return 0
+      local p
+      for p in 22 80 443 8080; do
+        tcp_open "$tip" "$p" 1 && return 0
+      done
+      local p6=""; [[ $tip == *:* ]] && p6="-6"
+      if ping $p6 -c1 -W1 "$tip" >/dev/null 2>&1; then
+        return 0
+      fi
+      if ip -br addr 2>/dev/null | grep -Eq 'tun|tap|wg|gre|ipip'; then
+        return 0
+      fi
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+start_tunnel() {
+  local kind unit
+  kind=$(canonical_kind "$1")
+  unit=$(unit_for "$kind")
+  systemctl start "$unit" 2>/dev/null || true
+  sleep 2
+}
+
+stop_tunnel() {
+  local kind unit
+  kind=$(canonical_kind "$1")
+  unit=$(unit_for "$kind")
+  systemctl stop "$unit" 2>/dev/null || true
+}
+
+# Load list, de-duplicate by canonical kind, preserve order
 load_list() {
   [[ -f $LIST ]] || return 1
-  mapfile -t TUNNELS < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$LIST" | grep -v '^$' || true)
+  TUNNELS=()
+  local seen="|" t c
+  while read -r t; do
+    [[ -z $t || $t == \#* ]] && continue
+    c=$(canonical_kind "$t")
+    [[ $seen == *"|$c|"* ]] && continue
+    TUNNELS+=("$c")
+    seen+="${c}|"
+  done < "$LIST"
   (( ${#TUNNELS[@]} > 0 ))
 }
 
-# installed tunnels, in the configured order
-installed_list() {
-  local k out=()
-  for k in "${TUNNELS[@]}"; do is_installed "$k" && out+=("$k"); done
-  printf '%s\n' "${out[@]}"
-}
+set_active() { echo "$(canonical_kind "$1")" > "$ACTIVE"; }
+get_active() { [[ -f $ACTIVE ]] && canonical_kind "$(cat "$ACTIVE")" || echo ""; }
 
-set_active() { echo "$1" > "$ACTIVE"; }
-get_active() { [[ -f $ACTIVE ]] && cat "$ACTIVE" || echo ""; }
-
-# ---------- core failover loop ----------
 run_loop() {
   need_root
   load_list || { err "no tunnel list at $LIST — run: failover configure"; exit 1; }
 
-  mapfile -t CAND < <(installed_list)
-  if (( ${#CAND[@]} == 0 )); then
-    err "none of the listed tunnels are installed on this host; nothing to supervise"
-    err "set up at least one tunnel from the abtunnel menu, then re-enable failover"
-    exit 1
-  fi
-  if (( ${#CAND[@]} == 1 )); then
-    warn "only one tunnel installed (${CAND[0]}); will just keep it alive (no alternative to switch to)"
+  local fails=0 current
+  current=$(get_active)
+  if [[ -z $current ]] || ! printf '%s\n' "${TUNNELS[@]}" | grep -qx "$current"; then
+    current="${TUNNELS[0]}"
+    set_active "$current"
+    start_tunnel "$current"
   fi
 
-  # pick a starting tunnel: the saved one if still installed, else the first healthy, else the first
-  local current; current=$(get_active)
-  if [[ -z $current ]] || ! is_installed "$current"; then
-    current=""
-    local k
-    for k in "${CAND[@]}"; do is_healthy "$k" && { current="$k"; break; }; done
-    [[ -z $current ]] && current="${CAND[0]}"
-  fi
-  set_active "$current"
-  is_healthy "$current" || start_tunnel "$current"
-  log "failover supervisor started — candidates: ${CAND[*]}  active=$current"
+  log "failover started — unique tunnels: [${TUNNELS[*]}]  active=$current  interval=${CHECK_INTERVAL}s threshold=$FAIL_THRESHOLD"
 
-  local fails=0
   while true; do
-    # refresh the installed set each tick so newly-added tunnels join in
-    mapfile -t CAND < <(installed_list)
+    # reload list each loop so UI edits apply without full restart
+    load_list || true
+    if [[ ${#TUNNELS[@]} -eq 0 ]]; then
+      warn "tunnel list empty"; sleep "$CHECK_INTERVAL"; continue
+    fi
+    # if active removed from list, jump to first
+    if ! printf '%s\n' "${TUNNELS[@]}" | grep -qx "$current"; then
+      current="${TUNNELS[0]}"
+      set_active "$current"
+      start_tunnel "$current"
+      fails=0
+    fi
 
     if is_healthy "$current"; then
       fails=0
-      sleep "$CHECK_INTERVAL"
-      continue
-    fi
-
-    fails=$((fails + 1))
-    warn "health check failed for [$current] ($fails/$FAIL_THRESHOLD)"
-    if (( fails < FAIL_THRESHOLD )); then
-      sleep "$CHECK_INTERVAL"
-      continue
-    fi
-
-    # Try each OTHER installed tunnel, starting right after current in the list.
-    local n=${#CAND[@]} start=0 i k switched=0
-    for i in "${!CAND[@]}"; do [[ ${CAND[$i]} == "$current" ]] && start=$(( (i + 1) % n )); done
-    for (( i = 0; i < n; i++ )); do
-      k="${CAND[$(( (start + i) % n ))]}"
-      [[ $k == "$current" ]] && continue
-      warn "trying failover: $current → $k"
-      start_tunnel "$k"
-      if wait_healthy "$k"; then
-        stop_tunnel "$current"       # only drop the old one once the new one works
-        current="$k"; set_active "$current"; fails=0; switched=1
-        log "switched OK to $current"
-        break
+    else
+      fails=$((fails + 1))
+      warn "health failed [$current] ($fails/$FAIL_THRESHOLD)"
+      if (( fails >= FAIL_THRESHOLD )); then
+        local idx next found=0 i
+        for i in "${!TUNNELS[@]}"; do
+          if [[ ${TUNNELS[$i]} == "$current" ]]; then idx=$i; found=1; break; fi
+        done
+        if (( found )); then
+          next="${TUNNELS[$(( (idx + 1) % ${#TUNNELS[@]} ))]}"
+        else
+          next="${TUNNELS[0]}"
+        fi
+        # skip if only one unique tunnel
+        if [[ $next == "$current" ]]; then
+          warn "only one tunnel in list — restarting $current"
+          stop_tunnel "$current"
+          start_tunnel "$current"
+          fails=0
+        else
+          warn "switching: $current → $next"
+          stop_tunnel "$current"
+          start_tunnel "$next"
+          current=$next
+          set_active "$current"
+          fails=0
+          if is_healthy "$next"; then log "switched OK to $next"; else warn "next $next not confirmed yet"; fi
+        fi
       fi
-      warn "$k did not come up; leaving it and trying the next option"
-      stop_tunnel "$k"
-    done
-
-    if (( ! switched )); then
-      err "no healthy alternative found; restarting [$current] and staying on it"
-      start_tunnel "$current"
-      fails=0   # avoid hammering; re-evaluate next tick
     fi
     sleep "$CHECK_INTERVAL"
   done
 }
 
-# ---------- configure ----------
-# Build the ordered list from tunnels actually installed on this host. Falls back
-# to the default order (commented) when nothing is set up yet.
+# Default list: unique real stacks only
 cmd_configure() {
   need_root
   mkdir -p "$STATE"
-  {
-    echo "# ordered tunnel list for failover (first = highest priority)"
-    echo "# only installed tunnels are used at runtime; edit freely"
-  } > "$LIST"
-  local k found=0
-  for k in "${ALL_KINDS[@]}"; do
-    if is_installed "$k"; then echo "$k" >> "$LIST"; found=$((found+1)); fi
+  # Prefer stacks that actually have a unit installed
+  local candidates=(tunlink openvpn gre ipip wireguard) out=() c unit
+  for c in "${candidates[@]}"; do
+    unit=$(unit_for "$c")
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${unit}"; then
+      out+=("$c")
+    elif [[ -f /etc/systemd/system/${unit}.service ]] || [[ -f /lib/systemd/system/${unit}.service ]]; then
+      out+=("$c")
+    fi
   done
-  if (( found == 0 )); then
-    { echo "backhaul"; echo "openvpn"; echo "gre"; echo "ipip"; } >> "$LIST"
-    warn "no tunnels installed yet — wrote the default order; set tunnels up before relying on failover"
-  else
-    log "configured failover for $found installed tunnel(s)"
+  # Always include tunlink first as primary reverse tunnel even if unit not yet created
+  if [[ ${#out[@]} -eq 0 ]] || ! printf '%s\n' "${out[@]}" | grep -qx tunlink; then
+    out=(tunlink "${out[@]}")
   fi
+  # de-dup
+  local seen="|" final=()
+  for c in "${out[@]}"; do
+    c=$(canonical_kind "$c")
+    [[ $seen == *"|$c|"* ]] && continue
+    final+=("$c"); seen+="${c}|"
+  done
+
+  {
+    echo "# ordered unique tunnel list (first = highest priority)"
+    echo "# edited by: sudo abtunnel → Failover → ویرایش ترتیب"
+    printf '%s\n' "${final[@]}"
+  } > "$LIST"
+  log "list written to $LIST"
+  cat "$LIST"
+}
+
+# Write list from args or stdin lines
+cmd_set_list() {
+  need_root
+  mkdir -p "$STATE"
+  local items=() x c seen="|"
+  if [[ $# -gt 0 ]]; then
+    items=("$@")
+  else
+    while read -r x; do
+      [[ -z $x || $x == \#* ]] && continue
+      items+=("$x")
+    done
+  fi
+  {
+    echo "# ordered unique tunnel list (first = highest priority)"
+    for x in "${items[@]}"; do
+      c=$(canonical_kind "$x")
+      [[ $seen == *"|$c|"* ]] && continue
+      echo "$c"
+      seen+="${c}|"
+    done
+  } > "$LIST"
+  log "list updated:"
   grep -v '^#' "$LIST" || true
 }
 
 cmd_status() {
   echo -e "${c_c}══ Failover Status ══${c_0}"
-  if load_list; then
-    echo "Tunnel order (★ = installed):"
-    local i=1 a t mark inst h
+  echo "interval=${CHECK_INTERVAL}s  threshold=${FAIL_THRESHOLD}  (no ICMP required)"
+  if [[ -f $LIST ]]; then
+    local i=1 a t h mark seen="|"
     a=$(get_active)
-    for t in "${TUNNELS[@]}"; do
+    while read -r t; do
+      [[ -z $t || $t == \#* ]] && continue
+      t=$(canonical_kind "$t")
+      [[ $seen == *"|$t|"* ]] && continue
+      seen+="${t}|"
       mark=" "; [[ $t == "$a" ]] && mark="→"
-      inst="  "; is_installed "$t" && inst="★ "
-      if is_installed "$t"; then is_healthy "$t" && h="UP" || h="DOWN"; else h="not installed"; fi
-      printf "  %s %s%d) %-10s %s\n" "$mark" "$inst" "$i" "$t" "$h"
+      h="DOWN"; is_healthy "$t" && h="UP" || true
+      printf "  %s %d) %-12s  %s  (%s)\n" "$mark" "$i" "$t" "$h" "$(unit_for "$t")"
       i=$((i+1))
-    done
+    done < "$LIST"
+    (( i == 1 )) && echo "  (list empty)"
   else
-    echo "  (not configured — run: failover configure)"
+    echo "  (not configured — run: install or configure)"
   fi
   echo
-  if systemctl is-active --quiet abtunnel-failover 2>/dev/null; then
-    echo -e "Supervisor: ${c_g}running${c_0}"
-  else
-    echo -e "Supervisor: ${c_r}stopped${c_0}"
-  fi
+  systemctl is-active --quiet abtunnel-failover 2>/dev/null \
+    && echo -e "Supervisor: ${c_g}running${c_0}" \
+    || echo -e "Supervisor: ${c_r}stopped${c_0}"
 }
 
 cmd_install_unit() {
@@ -238,12 +374,14 @@ cmd_install_unit() {
   local self; self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
   cat > /etc/systemd/system/abtunnel-failover.service <<UNIT
 [Unit]
-Description=tunxall intelligent tunnel failover
+Description=tunxall tunnel failover (TCP health, unique targets)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=CHECK_INTERVAL=${CHECK_INTERVAL}
+Environment=FAIL_THRESHOLD=${FAIL_THRESHOLD}
 ExecStart=/usr/bin/env bash $self run
 Restart=always
 RestartSec=5
@@ -253,21 +391,20 @@ WantedBy=multi-user.target
 UNIT
   systemctl daemon-reload
   systemctl enable --now abtunnel-failover.service
-  log "failover supervisor installed and started"
+  log "failover supervisor installed"
 }
 
 cmd_stop() {
   systemctl disable --now abtunnel-failover.service 2>/dev/null || true
-  log "failover supervisor stopped"
+  log "failover stopped"
 }
-
-usage() { echo "Usage: $0 {run|configure|status|install|stop}"; }
 
 case "${1:-}" in
   run)       run_loop;;
   configure) cmd_configure;;
+  set-list)  shift; cmd_set_list "$@";;
   status)    cmd_status;;
   install)   cmd_configure; cmd_install_unit;;
   stop)      cmd_stop;;
-  *)         usage; exit 1;;
+  *)         echo "Usage: $0 {run|configure|set-list|status|install|stop}"; exit 1;;
 esac

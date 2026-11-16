@@ -12,7 +12,7 @@
 #   gre6     — GRE over an IPv6 endpoint (inner IPv6).
 #   ip6ip6   — IPv6-in-IPv6.
 #   openvpn  — point-to-point OpenVPN tunnel (static key, AES-256).
-#   backhaul — high-performance reverse tunnel (tcp/tcpmux/ws/wss/grpc/grpcs) with multi-server auto-select.
+#   tunlink — high-performance reverse tunnel (tcp/tcpmux/ws/wss/grpc/grpcs) with multi-server auto-select.
 #   (WireGuard lives in wg-tunnel.sh.)
 # For gre/ipip/sit/gre6/ip6ip6: add --psk to encrypt with IPsec, or omit for plain.
 #
@@ -25,14 +25,14 @@
 # Status/down:   sudo bash abtunnel.sh status | down <type>
 set -euo pipefail
 
-# Load backhaul helper if present
+# Load tunlink helper if present
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -f "$SCRIPT_DIR/backhaul-helper.sh" ]]; then
+if [[ -f "$SCRIPT_DIR/tunlink-helper.sh" ]]; then
   # shellcheck source=/dev/null
-  source "$SCRIPT_DIR/backhaul-helper.sh"
-elif [[ -f /usr/local/lib/tunxall/backhaul-helper.sh ]]; then
+  source "$SCRIPT_DIR/tunlink-helper.sh"
+elif [[ -f /usr/local/lib/tunxall/tunlink-helper.sh ]]; then
   # shellcheck source=/dev/null
-  source /usr/local/lib/tunxall/backhaul-helper.sh
+  source /usr/local/lib/tunxall/tunlink-helper.sh
 fi
 
 DIR=/etc/abtunnel
@@ -110,17 +110,6 @@ detect_pubip() {
   ip=$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)
   [[ -z $ip ]] && ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')
   echo "$ip"
-}
-
-# detect_pubip_fam <4|6> — public IP of the requested family.
-detect_pubip_fam() {
-  if [[ ${1:-4} == 6 ]]; then
-    curl -6 -fsS --max-time 5 https://ifconfig.co 2>/dev/null \
-      || curl -6 -fsS --max-time 5 https://api6.ipify.org 2>/dev/null \
-      || ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}'
-  else
-    detect_pubip
-  fi
 }
 
 # detect_path_mtu <peer> — largest unfragmented packet size to peer (bytes),
@@ -382,8 +371,6 @@ EOF
   chmod +x $DIR/$ifn-up.sh $DIR/$ifn-down.sh
   mkoneshot "abtunnel-$kind" "$DIR/$ifn-up.sh" "$DIR/$ifn-down.sh"
   enable_forwarding
-  # Auto-forward requested ports into the tunnel toward the peer's inner IP.
-  [[ $role == server && -n ${FWD_PORTS:-} ]] && create_forwards "$peeraddr" "${FWD_PROTO:-tcp}" "$FWD_PORTS" "${FWD_SVC:-}" || true
   log "$kind tunnel up: this side ${myaddr%/*} <-> peer $peeraddr (iface $ifn, endpoints over IPv$fam, MTU $mtu)"
   log "Forward a service into the tunnel:  sudo bash abtunnel.sh forward --proto tcp --in-port <PORT> --to $peeraddr --to-port <PORT>"
   log "Test:  ping$([[ $inner == 6 ]] && echo ' -6') -c3 $peeraddr"
@@ -405,10 +392,9 @@ openvpn_server() {
   need_root; apt_install openvpn; mkdir -p $DIR && chmod 700 $DIR
   [[ -f $DIR/ovpn.key ]] || openvpn --genkey secret $DIR/ovpn.key 2>/dev/null || openvpn --genkey --secret $DIR/ovpn.key
   local mssfix; mssfix=$(ovpn_mssfix)
-  local oproto=udp; [[ ${FAM:-4} == 6 ]] && oproto=udp6
   cat > $DIR/ovpn.conf <<EOF
 dev tun
-proto $oproto
+proto udp
 port $OVPN_PORT
 ifconfig 10.30.0.1 10.30.0.2
 secret $DIR/ovpn.key
@@ -421,8 +407,6 @@ persist-tun
 EOF
   mkunit abtunnel-openvpn "$(command -v openvpn) --config $DIR/ovpn.conf"
   enable_forwarding
-  # Auto-forward requested ports into the tunnel toward the peer (10.30.0.2).
-  [[ -n ${FWD_PORTS:-} ]] && create_forwards 10.30.0.2 "${FWD_PROTO:-tcp}" "$FWD_PORTS" "${FWD_SVC:-}" || true
   local pub token
   pub="${PUBLIC_IP:-}"; [[ -n $pub ]] || pub=$(detect_pubip)
   token=$(printf 'T=openvpn;PEER=%s;PORT=%s;KEY=%s' "$pub" "$OVPN_PORT" "$(base64 -w0 $DIR/ovpn.key)" | base64 -w0)
@@ -444,10 +428,9 @@ openvpn_client() {
   [[ "$CERT" -ef "$DIR/ovpn.key" ]] || cp "$CERT" "$DIR/ovpn.key"
   chmod 600 "$DIR/ovpn.key"
   local mssfix; mssfix=$(ovpn_mssfix "$PEER")
-  local oproto=udp; [[ $PEER == *:* ]] && oproto=udp6   # IPv6 peer → udp6
   cat > $DIR/ovpn.conf <<EOF
 dev tun
-proto $oproto
+proto udp
 remote $PEER $OVPN_PORT
 ifconfig 10.30.0.2 10.30.0.1
 secret $DIR/ovpn.key
@@ -520,26 +503,6 @@ EOF
 # ----------------------------------------------------- port forwarding
 # DNAT a port on THIS server into the tunnel toward the peer's tunnel IP.
 # Example: expose a DB that runs on the peer, reachable on this server's :3306.
-# create_forwards <peer_inner_ip> <proto> <ports_csv> [svc_port]
-# Auto-DNAT each public port on this server into the tunnel toward the peer's
-# inner IP. Used so interface tunnels (openvpn/gre/ipip/…) forward traffic
-# automatically, the same way backhaul's port mapping does.
-create_forwards() {
-  local peer="$1" proto="${2:-tcp}" ports="$3" svc="${4:-}"
-  [[ -n $peer && -n $ports ]] || return 0
-  local o_proto=$PROTO o_in=$IN_PORT o_to=$TO o_tp=$TO_PORT
-  local p tp arr ok=0
-  IFS=',' read -ra arr <<< "$ports"
-  for p in "${arr[@]}"; do
-    p=$(echo "$p" | xargs); [[ $p =~ ^[0-9]{1,5}$ ]] || continue
-    tp="$svc"; [[ -z $tp ]] && tp="$p"
-    PROTO="$proto"; IN_PORT="$p"; TO="$peer"; TO_PORT="$tp"
-    cmd_forward >/dev/null 2>&1 && ok=1
-  done
-  PROTO=$o_proto; IN_PORT=$o_in; TO=$o_to; TO_PORT=$o_tp
-  [[ $ok == 1 ]]
-}
-
 cmd_forward() {
   need_root; apt_install iptables
   [[ -n $IN_PORT ]] || die "need --in-port <port to accept on this server>"
@@ -597,7 +560,7 @@ cmd_uninstall() {
   cmd_down forward 2>/dev/null || true
   systemctl disable --now abtunnel-stunnel abtunnel-ssh abtunnel-openvpn \
     abtunnel-gre abtunnel-ipip abtunnel-sit abtunnel-gre6 abtunnel-ip6ip6 \
-    abtunnel-forward abtunnel-health.timer abtunnel-health abtunnel-backhaul 2>/dev/null || true
+    abtunnel-forward abtunnel-health.timer abtunnel-health abtunnel-tunlink abtunnel-backhaul 2>/dev/null || true
   ipsec stop 2>/dev/null || true
   systemctl stop strongswan-starter strongswan 2>/dev/null || true
   wg-quick down wg0 2>/dev/null || true
@@ -613,9 +576,9 @@ cmd_uninstall() {
 
 # -------------------------------------------------------------------- misc
 cmd_status() {
-  echo "== abtunnel units =="; systemctl --no-pager --type=service 2>/dev/null | grep -E 'abtunnel|strongswan|ipsec|openvpn|backhaul' || echo "  (none)"
-  if command -v backhaul_status &>/dev/null || type backhaul_status &>/dev/null; then
-    echo "== backhaul =="; backhaul_status || true
+  echo "== abtunnel units =="; systemctl --no-pager --type=service 2>/dev/null | grep -E 'abtunnel|strongswan|ipsec|openvpn|tunlink' || echo "  (none)"
+  if command -v tunlink_status &>/dev/null || type tunlink_status &>/dev/null; then
+    echo "== reverse تانل =="; tunlink_status || true
   fi
   echo "== watchdog =="; systemctl --no-pager list-timers abtunnel-health.timer 2>/dev/null | head -2 || true
   echo "== ipsec =="; ipsec status 2>/dev/null || echo "  (strongSwan not active)"
@@ -645,24 +608,25 @@ cmd_down() {
         rm -f "$f"
       done
       systemctl disable --now abtunnel-forward.service 2>/dev/null || true;;
-    backhaul) type backhaul_down >/dev/null 2>&1 || die "backhaul helper not installed"; backhaul_down;;
-    *) die "Usage: down <stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn|backhaul|forward>";;
+    tunlink) type tunlink_down >/dev/null 2>&1 || die "tunlink helper not installed"; tunlink_down;;
+    *) die "Usage: down <stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn|tunlink|forward>";;
   esac
   log "stopped: ${1:-}"
 }
 
 # ------------------------------------------------- connect from token (client)
 token_type() { # print the T= field of a connection token (empty if invalid)
-  { printf '%s' "${1:-}" | tr -d ' \r\n' | base64 -d 2>/dev/null | tr ';' '\n' | sed -n 's/^T=//p' | head -1; } || true
+  # Tokens from older "backhaul" servers use the same protocol, so treat them as tunlink.
+  { printf '%s' "${1:-}" | tr -d ' \r\n' | base64 -d 2>/dev/null | tr ';' '\n' | sed -n 's/^T=//p' | head -1 | sed 's/^backhaul$/tunlink/'; } || true
 }
 
 cmd_connect() {
   need_root
   local tok="${1:-}"; [[ -n $tok ]] || die "usage: abtunnel connect <TOKEN>"
   tok=$(printf '%s' "$tok" | tr -d ' \r\n')
-  if [[ $(token_type "$tok") == backhaul ]]; then
-    type backhaul_connect_token >/dev/null 2>&1 || die "backhaul helper not installed (re-run install.sh)"
-    backhaul_connect_token "$tok"
+  if [[ $(token_type "$tok") == tunlink ]]; then
+    type tunlink_connect_token >/dev/null 2>&1 || die "tunlink helper not installed (re-run install.sh)"
+    tunlink_connect_token "$tok"
     return
   fi
   apt_install openvpn coreutils
@@ -716,29 +680,42 @@ report_client() { # proto — test reachability and report
         return 1
       fi
       ;;
-    backhaul)
+    tunlink)
       local i since; since=$(date '+%Y-%m-%d %H:%M:%S' -d '-30 sec' 2>/dev/null || echo "-1min")
       for i in $(seq 1 10); do
-        if journalctl -u abtunnel-backhaul --since "$since" --no-pager 2>/dev/null | grep -q 'control channel established'; then
-          log "موفق — کانال کنترل backhaul به سرور وصل شد."
+        if journalctl -u abtunnel-tunlink --since "$since" --no-pager 2>/dev/null | grep -q 'control channel established'; then
+          log "موفق — کانال کنترل tunlink به سرور وصل شد."
           return 0
         fi
         sleep 2
       done
-      warn "تانل backhaul تأیید نشد. لاگ:  journalctl -u abtunnel-backhaul -n 30"
+      warn "تانل tunlink تأیید نشد. لاگ:  journalctl -u abtunnel-tunlink -n 30"
       return 1
       ;;
   esac
   t=$(client_test_ip "$proto")
   [[ -z $t ]] && { log "پیکربندی شد. (تست خودکار برای $proto تعریف نشده)"; return 0; }
   [[ $t == *:* ]] && p6="-6"
-  if ping $p6 -c3 -W2 "$t" >/dev/null 2>&1; then
-    log "موفق — تانل بالا آمد (پیر $t در دسترس است)."
+  # 1) TCP probes first — works when ICMP ping is blocked
+  local p
+  for p in 22 80 443 8080; do
+    if timeout 2 bash -c "echo >/dev/tcp/$t/$p" 2>/dev/null; then
+      log "موفق — تانل بالا آمد (TCP به $t:$p برقرار است؛ پینگ لازم نیست)."
+      return 0
+    fi
+  done
+  # 2) Optional ping — only a bonus signal
+  if ping $p6 -c2 -W2 "$t" >/dev/null 2>&1; then
+    log "موفق — تانل بالا آمد (پینگ $t پاسخ داد)."
     return 0
-  else
-    warn "تانل بالا نیامد (پاسخی از $t نرسید)."
-    return 1
   fi
+  # 3) Interface present?
+  if ip -br addr 2>/dev/null | grep -Eq 'tun|tap|wg|gre'; then
+    log "موفق‌نما — اینترفیس تانل بالا است (پینگ بین سرورها ممکن است بسته باشد)."
+    return 0
+  fi
+  warn "تانل تأیید نشد (نه TCP و نه پینگ به $t)."
+  return 1
 }
 
 # ---------- helpers for simple auto mode ----------
@@ -775,17 +752,17 @@ auto_server() {
   echo "تانل‌ها به ترتیب آماده می‌شوند. روی سرور دیگر حالت خودکار (کلاینت) را بزنید."
   echo
 
-  # 1) Backhaul (easiest token-based reverse tunnel)
+  # 1) تانل (easiest token-based reverse tunnel)
   echo "────────────────────────────────────"
-  log "۱/۴ آماده‌سازی Backhaul..."
+  log "۱/۴ آماده‌سازی تانل TCP (بدون نیاز به پینگ)..."
   ACCEPT_PORT=3080
   PSK="$(openssl rand -hex 12 2>/dev/null || echo "tunxall$(date +%s)")"
   TRANSPORT=tcp
   PORTS="443,8080"
-  if ( backhaul_server ); then
-    log "Backhaul آماده است (پورت 3080)."
+  if ( tunlink_server ); then
+    log "تانل آماده است (پورت 3080)."
   else
-    warn "Backhaul آماده نشد — ادامه می‌دهیم."
+    warn "تانل آماده نشد — ادامه می‌دهیم."
   fi
 
   # 2) OpenVPN
@@ -838,19 +815,19 @@ auto_client() {
 
   local ok=0
 
-  # --- 1) Backhaul ---
+  # --- 1) تانل ---
   echo "════════════════════════════════════"
-  log "تست ۱/۴ — Backhaul"
-  echo "اگر روی سرور توکن Backhaul چاپ شده، اینجا Paste کنید."
+  log "تست ۱/۴ — تانل"
+  echo "اگر روی سرور توکن اتصال چاپ شده، اینجا Paste کنید."
   echo "اگر ندارید Enter بزنید تا رد شود."
-  read -rp "توکن Backhaul (یا Enter): " tok
+  read -rp "توکن اتصال (یا Enter): " tok
   if [[ -n $tok ]]; then
-    if ( backhaul_connect_token "$tok" ) && report_client backhaul; then
-      log "اتصال با Backhaul برقرار شد. تمام."
+    if ( tunlink_connect_token "$tok" ) && report_client tunlink; then
+      log "اتصال با تانل برقرار شد. تمام."
       return 0
     fi
-    warn "Backhaul وصل نشد."
-    quiet_down backhaul
+    warn "تانل وصل نشد."
+    quiet_down tunlink
     wait_minutes 3
   else
     # try with default port + ask token
@@ -858,15 +835,15 @@ auto_client() {
     if [[ -n $PSK ]]; then
       ACCEPT_PORT=3080
       TRANSPORT=tcp
-      if ( PEER="$peer_ip" PSK="$PSK" TRANSPORT=tcp backhaul_client ) && report_client backhaul; then
-        log "اتصال با Backhaul برقرار شد. تمام."
+      if ( PEER="$peer_ip" PSK="$PSK" TRANSPORT=tcp tunlink_client ) && report_client tunlink; then
+        log "اتصال با تانل برقرار شد. تمام."
         return 0
       fi
-      warn "Backhaul وصل نشد."
-      quiet_down backhaul
+      warn "تانل وصل نشد."
+      quiet_down tunlink
       wait_minutes 3
     else
-      warn "توکن نبود — Backhaul رد شد."
+      warn "توکن نبود — تانل رد شد."
     fi
   fi
 
@@ -925,7 +902,7 @@ manual_setup() {
 
   echo
   echo "پروتکل را انتخاب کنید:"
-  echo "  1) Backhaul   (پیشنهادی — reverse tunnel)"
+  echo "  1) TCP تانل  (پیشنهادی — reverse tunnel)"
   echo "  2) OpenVPN"
   echo "  3) WireGuard"
   echo "  4) GRE"
@@ -937,7 +914,7 @@ manual_setup() {
 
   local proto=""
   case "$p" in
-    1) proto=backhaul;;
+    1) proto=tunlink;;
     2) proto=openvpn;;
     3) proto=wireguard;;
     4) proto=gre;;
@@ -950,12 +927,12 @@ manual_setup() {
 
   if [[ $role == server ]]; then
     case "$proto" in
-      backhaul)
+      tunlink)
         read -rp "پورت گوش‌دادن [3080]: " ACCEPT_PORT; ACCEPT_PORT=${ACCEPT_PORT:-3080}
         read -rp "توکن (خالی = ساخت خودکار): " PSK
         read -rp "نوع حمل (tcp/tcpmux/ws/wss/grpc/grpcs) [tcp]: " TRANSPORT; TRANSPORT=${TRANSPORT:-tcp}
         PORTS="443,8080"
-        ( backhaul_server ) || warn "ناموفق"
+        ( tunlink_server ) || warn "ناموفق"
         ;;
       openvpn)
         read -rp "پورت UDP [51820]: " OVPN_PORT; OVPN_PORT=${OVPN_PORT:-51820}
@@ -967,10 +944,7 @@ manual_setup() {
         ;;
       gre|ipip)
         read -rp "PSK مشترک (خالی = بدون رمز): " PSK
-        read -rp "پورت‌هایی که خودکار به داخل تانل فوروارد شوند (مثلاً 80,443؛ خالی = هیچ): " FWD_PORTS
         ( iface_tunnel_setup "$proto" server ) || warn "ناموفق"
-        [[ -n ${FWD_PORTS:-} ]] && log "فوروارد خودکار برای پورت‌های: $FWD_PORTS"
-        FWD_PORTS=""
         ;;
       ssh)
         read -rp "کلید عمومی کلاینت (خالی = بعداً): " PUBKEY
@@ -987,20 +961,20 @@ manual_setup() {
     esac
   else
     case "$proto" in
-      backhaul)
+      tunlink)
         echo "توکن سرور را Paste کنید (یا Enter برای ورود دستی):"
         read -r tok
         if [[ -n $tok ]]; then
-          ( backhaul_connect_token "$tok" ) || warn "ناموفق"
+          ( tunlink_connect_token "$tok" ) || warn "ناموفق"
         else
           read -rp "آدرس سرور (ip یا ip:port): " PEERS
           read -rp "توکن: " PSK
           read -rp "نوع حمل (همان سرور: tcp/tcpmux/ws/wss/grpc/grpcs) [tcp]: " TRANSPORT; TRANSPORT=${TRANSPORT:-tcp}
           ACCEPT_PORT=3080
           if [[ "$PEERS" != *:* ]]; then PEERS="${PEERS}:3080"; fi
-          ( PEERS="$PEERS" PSK="$PSK" TRANSPORT="$TRANSPORT" backhaul_client ) || warn "ناموفق"
+          ( PEERS="$PEERS" PSK="$PSK" TRANSPORT="$TRANSPORT" tunlink_client ) || warn "ناموفق"
         fi
-        report_client backhaul || true
+        report_client tunlink || true
         ;;
       openvpn)
         echo "توکن OpenVPN سرور را Paste کنید:"
@@ -1195,12 +1169,12 @@ tunnel_units() { # list installed abtunnel tunnel units (without .service)
 
 unit_label() { # friendly name of a unit
   local kind=${1#abtunnel-} extra=""
-  if [[ $kind == backhaul ]]; then
-    if [[ -f $DIR/backhaul/server.toml ]]; then extra="سرور اول، $(sed -n 's/^transport = "\(.*\)"/\1/p' $DIR/backhaul/server.toml | head -1)"
-    elif [[ -f $DIR/backhaul/client.toml ]]; then extra="سرور دوم، $(sed -n 's/^transport = "\(.*\)"/\1/p' $DIR/backhaul/client.toml | head -1)"; fi
+  if [[ $kind == tunlink ]]; then
+    if [[ -f $DIR/tunlink/server.toml ]]; then extra="سرور اول، $(sed -n 's/^transport = "\(.*\)"/\1/p' $DIR/tunlink/server.toml | head -1)"
+    elif [[ -f $DIR/tunlink/client.toml ]]; then extra="سرور دوم، $(sed -n 's/^transport = "\(.*\)"/\1/p' $DIR/tunlink/client.toml | head -1)"; fi
   fi
   case "$kind" in
-    backhaul) echo "Backhaul${extra:+ ($extra)}";;
+    tunlink|noping) echo "تانل${extra:+ ($extra)}";;
     openvpn)  echo "OpenVPN";;
     stunnel)  echo "Stunnel (TLS)";;
     ssh)      echo "SSH";;
@@ -1209,132 +1183,116 @@ unit_label() { # friendly name of a unit
 }
 
 # ---------------------------------------------------------------- screens
-# smart_pick_backhaul — choose transport + tport automatically. Picks the first
-# locally-free port (a real local test), preferring a saved netcheck best port and
-# HTTPS-looking ports; uses grpcs (TLS, looks like HTTPS) there, else tcpmux.
-# Sets the caller's `transport` and `tport` (bash dynamic scope).
-smart_pick_backhaul() {
-  local cand=() p b
-  if [[ -f $DIR/netcheck.env ]]; then
-    b=$( . "$DIR/netcheck.env" 2>/dev/null; echo "${BEST_PORT:-}" )
-    [[ $b =~ ^[0-9]+$ ]] && cand+=("$b")
-  fi
-  cand+=(443 8443 2096 2083 3080 8080)
-  tport=""
-  for p in "${cand[@]}"; do
-    [[ $p =~ ^[0-9]+$ ]] || continue
-    if ! port_in_use "$p"; then tport=$p; break; fi
-  done
-  [[ -z $tport ]] && tport=3080
-  case "$tport" in 443|8443|2096|2083|2087|2053) transport=grpcs;; *) transport=tcpmux;; esac
-}
-
 easy_server() {
   ui_banner
   ui_title "ساخت تانل جدید (روی سرور اول)"
   echo -e "  ${U_D}این سرور تانل را می‌سازد و یک «توکن» به شما می‌دهد.${U_0}"
   echo -e "  ${U_D}بعد همان توکن را روی سرور دوم Paste می‌کنید. تمام!${U_0}"
 
-  # ---- Step 1: IP family ----
-  ui_step 1 4 "نسخه IP تانل"
-  ui_opt 1 "IPv4" "معمولی — اکثر سرورها"
-  ui_opt 2 "IPv6"
-  local famc; choose famc 2 1 || return 0
-  local FAM=4; [[ $famc == 2 ]] && FAM=6
+  ui_step 1 3 "نوع اتصال را انتخاب کنید"
+  ui_opt 1 "TCP سریع"                      "سریع و ساده — پیشنهادی"
+  ui_opt 2 "TCP مالتی‌پلکس"                 "چند کاربر روی یک اتصال"
+  ui_opt 3 "📡 بدون پینگ (No-Ping)"         "حتی اگر پینگ بین دو سرور بسته باشد کار می‌کند"
+  ui_opt 4 "🛡️  HTTPS Camouflage"           "صفحه فریب + تانل مخفی — مقاوم به DPI"
+  ui_opt 5 "🎭 Spoof / WebSocket / gRPC"   "شبیه ترافیک وب"
+  ui_opt 6 "OpenVPN"                       "شبکه‌ی خصوصی کامل"
+  ui_opt 0 "برگشت"
+  local c; choose c 6 1 || return 0
+  [[ $c == 0 ]] && return 0
+  local kind=tunlink transport=tcp
+  case "$c" in
+    1) transport=tcp;;
+    2) transport=tcpmux;;
+    3) transport=tcp; ui_info "حالت No-Ping + Shape: TCP بدون پینگ؛ اندازه پکت‌ها تصادفی می‌شود تا الگوی VPN دیده نشود.";;
+    4) transport=https; ui_info "HTTPS Camouflage + Shape: ظاهر HTTPS + پدینگ تصادفی اندازه پکت (ضد انگشت‌نگاری VPN)";;
+    5)
+      echo
+      ui_opt 1 "gRPC+TLS (شبیه HTTPS)"
+      ui_opt 2 "WebSocket"
+      ui_opt 3 "gRPC ساده"
+      local c2; choose c2 3 1 || return 0
+      case "$c2" in 1) transport=grpcs;; 2) transport=ws;; 3) transport=grpc;; esac
+      ;;
+    6) kind=openvpn;;
+  esac
 
-  # ---- Step 2: smart or manual protocol ----
-  ui_step 2 4 "انتخاب پروتکل"
-  ui_opt 1 "هوشمند (خودکار)"        "بهترین پورت و پروتکل را خودش انتخاب و راه‌اندازی می‌کند"
-  ui_opt 2 "دستی (خودم انتخاب کنم)"
-  local modec; choose modec 2 1 || return 0
-
-  local kind=backhaul transport=tcp tport="" users_ports="" svc_port=""
-
-  if [[ $modec == 1 ]]; then
-    smart_pick_backhaul    # sets transport + tport from a local port test + netcheck hint
-    ui_ok "انتخاب هوشمند: ${U_B}Backhaul / ${transport}${U_0} روی پورت ${U_B}${tport}${U_0}  (IPv${FAM})"
-    echo -e "  ${U_D}grpcs روی 443 شبیه HTTPS است و از اکثر فایروال‌ها رد می‌شود؛ tcpmux چند کاربر را روی یک اتصال می‌برد.${U_0}"
-  else
-    ui_step 3 4 "نوع اتصال"
-    ui_opt 1 "Backhaul TCP"               "سریع و ساده"
-    ui_opt 2 "Backhaul TCP مالتی‌پلکس"     "چند کاربر روی یک اتصال"
-    ui_opt 3 "Backhaul gRPC + TLS (443)"  "شبیه HTTPS — رد شدن از فایروال/DPI"
-    ui_opt 4 "Backhaul gRPC"              "وقتی TCP معمولی خوب کار نمی‌کند"
-    ui_opt 5 "Backhaul WebSocket"         "سازگار با CDN"
-    ui_opt 6 "OpenVPN"                    "شبکه‌ی خصوصی کامل"
-    ui_opt 0 "برگشت"
-    local c; choose c 6 1 || return 0
-    [[ $c == 0 ]] && return 0
-    case "$c" in
-      1) transport=tcp;; 2) transport=tcpmux;; 3) transport=grpcs;; 4) transport=grpc;; 5) transport=ws;; 6) kind=openvpn;;
-    esac
-
-    # default tunnel port: netcheck hint, else 443 for HTTPS-looking transports, else 3080
-    local sug_port="" sug_src=""
-    if [[ -f $DIR/netcheck.env ]]; then
-      sug_port=$( . "$DIR/netcheck.env" 2>/dev/null; echo "${BEST_PORT:-}" )
-      [[ -n $sug_port ]] && sug_src="(از نتیجه‌ی netcheck)"
-    fi
-    local def_tport=3080
-    case "$transport" in grpc|grpcs|ws|wss) def_tport=443;; esac
-    [[ -n $sug_port ]] && def_tport=$sug_port
-
-    if [[ $kind == backhaul ]]; then
-      [[ -n $sug_src ]] && ui_info "پیشنهاد پورت ارتباط: ${U_B}$def_tport${U_0} $sug_src"
-      while true; do
-        ask tport "پورت ارتباط بین دو سرور" "$def_tport" '^[0-9]{1,5}$' || return 0
-        port_in_use "$tport" && ! systemctl is-active --quiet abtunnel-backhaul 2>/dev/null \
-          && { ui_err "پورت $tport الان توسط برنامه‌ی دیگری استفاده می‌شود؛ پورت دیگری انتخاب کنید"; continue; }
-        break
-      done
-    else
-      ask tport "پورت UDP برای OpenVPN" "1194" '^[0-9]{1,5}$' || return 0
-    fi
+  # Suggest the best open port if a recent netcheck probe saved one.
+  local sug_port="" sug_src=""
+  if [[ -f $DIR/netcheck.env ]]; then
+    ( . "$DIR/netcheck.env" 2>/dev/null; echo "${BEST_PORT:-}" ) > /tmp/.abt_sug 2>/dev/null || true
+    sug_port=$(cat /tmp/.abt_sug 2>/dev/null); rm -f /tmp/.abt_sug
+    [[ -n $sug_port ]] && sug_src="(از نتیجه‌ی netcheck)"
   fi
+  # HTTPS-looking transports work best on 443; plain TCP uses a high port.
+  local def_tport=3080
+  case "$transport" in grpc|grpcs|ws|wss|https) def_tport=443;; esac
+  [[ -n $sug_port ]] && def_tport=$sug_port
 
-  # ---- Step: which service to expose (auto port-forward) ----
-  ui_step 4 4 "سرویسی که باید در دسترس شود"
-  if [[ $kind == backhaul ]]; then
-    echo -e "  ${U_D}کاربرها به کدام پورتِ این سرور وصل شوند؟ (چند پورت با کاما، مثلاً 443,8080)${U_0}"
-    ask users_ports "پورت کاربرها" "443" '^[0-9]{1,5}(-[0-9]{1,5})?(,[0-9]{1,5}(-[0-9]{1,5})?)*$' "مثل 443 یا 443,8080 یا 2000-2010 وارد کنید" || return 0
-    if [[ $users_ports =~ ^[0-9]+$ ]]; then
-      echo -e "  ${U_D}سرویس روی سرور دوم روی چه پورتی است؟ (اگر همان است فقط Enter بزنید)${U_0}"
+  local users_ports="" svc_port="" tport mapping=""
+  ui_step 2 3 "پورت‌ها (تانل جدا از پنل)"
+  if [[ $kind == tunlink ]]; then
+    echo -e "  ${U_B}الف) پورت تانل${U_0} ${U_D}— فقط بین دو سرور شما؛ لازم نیست با پورت پنل یکی باشد${U_0}"
+    case "$transport" in https|grpcs|wss|ws) def_tport=443;; *) def_tport=3080;; esac
+    [[ -n $sug_port ]] && def_tport=$sug_port
+    [[ -n $sug_src ]] && ui_info "پیشنهاد از netcheck: ${U_B}$def_tport${U_0} $sug_src"
+    while true; do
+      ask tport "پورت ارتباط بین دو سرور (تانل)" "$def_tport" '^[0-9]{1,5}$' || return 0
+      port_in_use "$tport" && ! systemctl is-active --quiet abtunnel-tunlink 2>/dev/null \
+        && { ui_err "پورت $tport اشغال است؛ پورت دیگری انتخاب کنید"; continue; }
+      break
+    done
+    echo
+    echo -e "  ${U_B}ب) پورت‌های پنل / inbound${U_0} ${U_D}— کاربرها و پنل به این پورت‌ها روی سرور اول وصل می‌شوند${U_0}"
+    echo -e "  ${U_D}می‌توانید هر پورتی بگذارید؛ لازم نیست با پورت تانل یکی باشد.${U_0}"
+    echo -e "  ${U_D}چند پورت: 443,8080,2096   |   مپ به مقصد: 443=127.0.0.1:8443${U_0}"
+    ask users_ports "پورت پنل/inbound روی سرور اول" "443,8080" '^[0-9A-Za-z.:=_,/-]+$' "مثال: 443 یا 443,8080 یا 443=127.0.0.1:8443" || return 0
+    # If user gave plain ports without mapping, optionally ask backend port
+    if [[ "$users_ports" =~ ^[0-9]+$ ]]; then
+      echo -e "  ${U_D}سرویس واقعی روی سرور دوم (کلاینت) کدام پورت است؟${U_0}"
       ask svc_port "پورت سرویس روی سرور دوم" "$users_ports" '^[0-9]{1,5}$' || return 0
+      if [[ -n $svc_port && $svc_port != "$users_ports" ]]; then
+        mapping="${users_ports}=${svc_port}"
+      else
+        mapping="$users_ports"
+      fi
+    else
+      mapping="$users_ports"
     fi
-  else
-    if confirm "یک سرویس از سرور دوم را خودکار روی این سرور در دسترس کنم؟"; then
-      ask users_ports "روی کدام پورت این سرور؟ (مثلاً 443 یا 80,443)" "443" '^[0-9]{1,5}(,[0-9]{1,5})*$' "مثل 443 یا 80,443 وارد کنید" || return 0
-      if [[ $users_ports =~ ^[0-9]+$ ]]; then
-        echo -e "  ${U_D}همان سرویس روی سرور دوم روی چه پورتی است؟ (اگر همان است Enter)${U_0}"
-        ask svc_port "پورت سرویس روی سرور دوم" "$users_ports" '^[0-9]{1,5}$' || return 0
+    # Safety: tunnel port must not collide with a panel listen port on same host
+    local first_panel
+    first_panel=$(echo "$mapping" | tr ',' '\n' | head -1 | sed 's/=.*//;s/.*://;s/[^0-9]//g')
+    if [[ -n $first_panel && $first_panel == "$tport" ]]; then
+      ui_info "توجه: پورت تانل و پورت پنل هر دو $tport است. اگر پنل و تانل روی یک IP گوش بدهند تداخل پیش می‌آید. در صورت امکان پورت تانل را عوض کنید."
+      if ! confirm "ادامه با پورت یکسان؟"; then
+        ask tport "پورت تانل جدید" "3080" '^[0-9]{1,5}$' || return 0
       fi
     fi
+  else
+    ask tport "پورت UDP برای OpenVPN" "1194" '^[0-9]{1,5}$' || return 0
   fi
 
-  # ---- Public IP (family-aware) ----
-  echo
-  local pub; pub=$(detect_pubip_fam "$FAM")
-  if [[ -n $pub ]] && { echo -e "  IP عمومی این سرور (IPv${FAM}): ${U_B}$pub${U_0}"; confirm "درست است؟"; }; then :
-  else ask pub "IP عمومی این سرور (IPv${FAM})" "" '^[][0-9A-Fa-f.:]+$' "یک IP معتبر وارد کنید" || return 0; fi
+  ui_step 3 3 "آدرس این سرور"
+  local pub; pub=$(detect_pubip)
+  if [[ -n $pub ]] && { echo -e "  IP عمومی این سرور: ${U_B}$pub${U_0}"; confirm "درست است؟"; }; then :
+  else ask pub "IP عمومی این سرور" "" '^[0-9A-Fa-f.:]+$' "یک IP معتبر وارد کنید" || return 0; fi
 
   echo; ui_line
   ui_info "اولین بار ممکن است یکی دو دقیقه طول بکشد..."
   local ok=0 token_file
-  if [[ $kind == backhaul ]]; then
-    local mapping="$users_ports"
-    [[ -n $svc_port && $svc_port != "$users_ports" ]] && mapping="$users_ports=$svc_port"
-    _mk() { BH_QUIET=1 FAM="$5" PUBLIC_IP="$1" ACCEPT_PORT="$2" PSK="" TRANSPORT="$3" PORTS="$4" backhaul_server; }
-    spin "ساخت تانل Backhaul ($transport)" _mk "$pub" "$tport" "$transport" "$mapping" "$FAM" && ok=1
-    token_file=$DIR/backhaul/connect.token
+  if [[ $kind == tunlink ]]; then
+    ask TOKEN_LABEL "نام این توکن (برای صندوق چندتوکنی)" "default" '^[A-Za-z0-9._-]*$' || true
+    TOKEN_LABEL=${TOKEN_LABEL:-default}
+    [[ -z $mapping ]] && mapping="$users_ports"
+    if type normalize_ports >/dev/null 2>&1; then mapping=$(normalize_ports "$mapping"); fi
+    _mk() { BH_QUIET=1 TOKEN_LABEL="${TOKEN_LABEL:-default}" PUBLIC_IP="$1" ACCEPT_PORT="$2" PSK="" TRANSPORT="$3" PORTS="$4" tunlink_server; }
+    spin "ساخت تانل ($transport)" _mk "$pub" "$tport" "$transport" "$mapping" && ok=1
+    token_file=$DIR/tunlink/connect.token
     [[ $ok == 1 ]] && open_firewall tcp "$tport" ${users_ports//,/ }
   else
-    _mk() { BH_QUIET=1 FAM="$5" PUBLIC_IP="$1" OVPN_PORT="$2" FWD_PORTS="$3" FWD_SVC="$4" openvpn_server; }
-    spin "ساخت تانل OpenVPN" _mk "$pub" "$tport" "$users_ports" "$svc_port" "$FAM" && ok=1
+    _mk() { BH_QUIET=1 PUBLIC_IP="$1" OVPN_PORT="$2" openvpn_server; }
+    spin "ساخت تانل OpenVPN" _mk "$pub" "$tport" && ok=1
     token_file=$DIR/ovpn-connect.token
-    if [[ $ok == 1 ]]; then
-      open_firewall udp "$tport"
-      [[ -n $users_ports ]] && open_firewall tcp ${users_ports//,/ }
-    fi
+    [[ $ok == 1 ]] && open_firewall udp "$tport"
   fi
 
   if [[ $ok == 1 && -s $token_file ]]; then
@@ -1345,12 +1303,6 @@ easy_server() {
     echo -e "   ۱) نصب:   ${U_CY}curl -fsSL https://raw.githubusercontent.com/${TUNXALL_REPO:-arshiakhadmi16-bot/tunxall}/main/install.sh | sudo bash${U_0}"
     echo -e "   ۲) در منو گزینه‌ی ${U_B}[2] وصل شدن با توکن${U_0} را بزنید و توکن را Paste کنید."
     echo -e "  ${U_D}(هر وقت خواستید از منوی اصلی «نمایش دوباره توکن» را بزنید.)${U_0}"
-    if [[ $kind == backhaul ]]; then
-      echo; ui_info "فوروارد پورت‌ها خودکار انجام شد — کاربرها به ${U_B}${users_ports}${U_0} این سرور وصل می‌شوند."
-    elif [[ $kind == openvpn && -n $users_ports ]]; then
-      echo; ui_info "پورت‌فوروارد خودکار ساخته شد: ${U_B}${users_ports}${U_0} → سرویس روی سرور دوم"
-      echo -e "  ${U_D}نکته: سرویس روی سرور دوم باید روی 0.0.0.0 گوش بده (نه فقط 127.0.0.1).${U_0}"
-    fi
   else
     echo; ui_err "${U_B}ساخت تانل ناموفق بود.${U_0}"
     ui_info "جزئیات خطا در بالا و در فایل $LOGFILE است."
@@ -1370,7 +1322,7 @@ easy_client() {
     tok=$(printf '%s' "$tok" | tr -d ' \r\n')
     [[ -z $tok ]] && return 0
     t=$(token_type "$tok")
-    [[ $t == backhaul || $t == openvpn ]] && break
+    [[ $t == tunlink || $t == openvpn ]] && break
     ui_err "این توکن معتبر نیست — مطمئن شوید کامل کپی شده است."
   done
 
@@ -1392,7 +1344,7 @@ easy_client() {
   echo
   if [[ $ok == 1 ]]; then
     ui_ok "${U_B}تانل وصل شد!${U_0} 🎉"
-    if [[ $t == backhaul ]]; then
+    if [[ $t == tunlink ]]; then
       ui_info "کاربرها حالا می‌توانند به $peer روی پورت‌هایی که روی سرور اول تعیین کردید وصل شوند."
     else
       ui_info "شبکه‌ی خصوصی برقرار است: این سرور 10.30.0.2 و سرور اول 10.30.0.1"
@@ -1447,55 +1399,79 @@ token_screen() {
   ui_banner
   ui_title "نمایش دوباره توکن"
   local shown=0
-  [[ -s $DIR/backhaul/connect.token ]] && { ui_token_box "توکن Backhaul" "$(cat $DIR/backhaul/connect.token)"; shown=1; }
+  [[ -s $DIR/tunlink/connect.token ]] && { ui_token_box "توکن فعال" "$(cat $DIR/tunlink/connect.token)"; shown=1; }
   [[ -s $DIR/ovpn-connect.token ]] && { ui_token_box "توکن OpenVPN" "$(cat $DIR/ovpn-connect.token)"; shown=1; }
+  local n=0
+  n=$(ls "$DIR"/tokens/*.token 2>/dev/null | wc -l | tr -d ' ')
+  if [[ ${n:-0} -gt 0 ]]; then
+    echo; ui_info "صندوق توکن‌ها: $n مورد — از منو «صندوق توکن‌ها» ببینید."
+    shown=1
+  fi
   [[ $shown == 0 ]] && ui_info "توکنی پیدا نشد. توکن فقط روی «سرور اول» و بعد از ساخت تانل ساخته می‌شود."
   ui_pause
 }
+
 
 
 failover_screen() {
   ui_banner
   ui_title "سوئیچ خودکار تانل (Failover)"
   echo -e "  ${U_D}اگر تانل فعلی قطع شود، خودکار به تانل بعدی می‌رود.${U_0}"
+  echo -e "  ${U_D}لیست بدون تکرار است؛ سلامت tunlink سخت‌گیرانه‌تر چک می‌شود.${U_0}"
   echo
-  ui_opt 1 "فعال‌سازی سوئیچ خودکار"   "نظارت + تعویض هوشمند"
+  ui_opt 1 "فعال‌سازی سوئیچ خودکار"    "نظارت + تعویض هوشمند"
   ui_opt 2 "وضعیت Failover"
-  ui_opt 3 "خاموش کردن"
+  ui_opt 3 "ویرایش ترتیب تانل‌ها"       "اولویت سوئیچ"
+  ui_opt 4 "خاموش کردن"
   ui_opt 0 "برگشت"
-  local c; choose c 3 || return 0
+  local c; choose c 4 || return 0
+
+  local helper=""
+  for pth in "$SCRIPT_DIR/failover.sh" /opt/tunxall/failover.sh /usr/local/lib/tunxall/failover.sh; do
+    [[ -x $pth ]] && helper=$pth && break
+  done
+
   case "$c" in
     1)
-      local helper=""
-      for p in "$SCRIPT_DIR/failover.sh" /opt/tunxall/failover.sh /usr/local/lib/tunxall/failover.sh; do
-        [[ -x $p ]] && helper=$p && break
-      done
-      if [[ -z $helper ]]; then
-        ui_err "فایل failover.sh پیدا نشد"
-        ui_pause; return 0
-      fi
+      if [[ -z $helper ]]; then ui_err "فایل failover.sh پیدا نشد"; ui_pause; return 0; fi
       ui_info "در حال نصب ناظر سوئیچ خودکار..."
       if bash "$helper" install >>"$LOGFILE" 2>&1; then
         ui_ok "سوئیچ خودکار فعال شد."
         echo -e "  ${U_D}هر ۲۰ ثانیه سلامت چک می‌شود؛ بعد از ۳ بار شکست → تانل بعدی${U_0}"
+        echo -e "  ${U_D}نام‌های تکراری (noping/https/tunlink) در یک هدف ادغام شدند.${U_0}"
       else
         ui_err "نصب ناموفق — جزئیات: $LOGFILE"
       fi
       ui_pause
       ;;
     2)
-      local helper=""
-      for p in "$SCRIPT_DIR/failover.sh" /opt/tunxall/failover.sh /usr/local/lib/tunxall/failover.sh; do
-        [[ -x $p ]] && helper=$p && break
-      done
-      [[ -n $helper ]] && bash "$helper" status || ui_info "failover پیکربندی نشده"
+      if [[ -z $helper ]]; then ui_info "failover پیکربندی نشده"; ui_pause; return 0; fi
+      bash "$helper" status
       ui_pause
       ;;
     3)
-      local helper=""
-      for p in "$SCRIPT_DIR/failover.sh" /opt/tunxall/failover.sh /usr/local/lib/tunxall/failover.sh; do
-        [[ -x $p ]] && helper=$p && break
-      done
+      if [[ -z $helper ]]; then ui_err "failover.sh نیست"; ui_pause; return 0; fi
+      echo
+      echo -e "  ${U_B}ترتیب فعلی:${U_0}"
+      bash "$helper" status || true
+      echo
+      echo -e "  ${U_D}نام‌های مجاز: tunlink openvpn gre ipip wireguard ssh stunnel${U_0}"
+      echo -e "  ${U_D}با فاصله بنویسید؛ اول = اولویت بالاتر. تکراری‌ها حذف می‌شوند.${U_0}"
+      local line
+      read -rp "  ➜ ترتیب جدید: " line || return 0
+      line=$(echo "$line" | xargs)
+      [[ -z $line ]] && { ui_info "خالی بود — بدون تغییر."; ui_pause; return 0; }
+      # shellcheck disable=SC2086
+      if bash "$helper" set-list $line >>"$LOGFILE" 2>&1; then
+        ui_ok "ترتیب ذخیره شد."
+        systemctl restart abtunnel-failover 2>/dev/null || true
+        bash "$helper" status || true
+      else
+        ui_err "ذخیره ناموفق"
+      fi
+      ui_pause
+      ;;
+    4)
       [[ -n $helper ]] && bash "$helper" stop
       ui_ok "سوئیچ خودکار خاموش شد."
       ui_pause
@@ -1503,6 +1479,7 @@ failover_screen() {
     0) return 0;;
   esac
 }
+
 
 remove_screen() {
   ui_banner
@@ -1554,7 +1531,9 @@ advanced_screen() {
          choose c "${#units[@]}" 1 || continue
          [[ $c == 0 ]] && continue
          UNIT=${units[$((c-1))]}
-         ask WATCH_IP "IP طرف مقابل داخل تانل برای ping" "10.30.0.1" '^[0-9A-Fa-f.:]+$' || continue
+         echo -e "  ${U_D}اگر پینگ بسته است، به‌جای IP یک پورت محلی باز بدهید (مثلاً 443).${U_0}"
+         ask WATCH_IP "IP برای ping (یا خالی)" "10.30.0.1" '^[0-9A-Fa-f.:]*$' || true
+         ask WATCH_PORT "یا پورت TCP محلی برای چک (اختیاری)" "" '^[0-9]{0,5}$' || true
          ( health_install ) && ui_ok "نگهبان فعال شد." || ui_err "ناموفق"
          ui_pause;;
       4) ( menu_advanced ) || true; ui_pause;;
@@ -1565,158 +1544,355 @@ advanced_screen() {
   done
 }
 
-# -------------------------------------------------------- main interactive menu
-# ---------------------------------------------------------------- speed test
-SPEED_PORT="${SPEED_PORT:-5201}"
 
-# iface_peer_ip <iface> — inner IP of the tunnel peer on a point-to-point iface.
-iface_peer_ip() {
-  local info; info=$(ip addr show dev "$1" 2>/dev/null) || return 0
-  local peer; peer=$(awk '{for(i=1;i<=NF;i++) if($i=="peer") print $(i+1)}' <<<"$info" | head -1)
-  if [[ -n $peer ]]; then echo "${peer%/*}"; return; fi
-  local my; my=$(awk '/inet6? /{print $2; exit}' <<<"$info"); my=${my%/*}
-  case "$my" in
-    *.1) echo "${my%.*}.2";; *.2) echo "${my%.*}.1";;
-    *::1) echo "${my%1}2";;  *::2) echo "${my%2}1";;
-  esac
-}
-# local inner IP of the first up tunnel iface (for binding the iperf server)
-speed_local_ip() {
-  local ifn
-  for ifn in tun0 gre1 ipip1 sit1 gre6 ip6t1 wg0; do
-    ip link show "$ifn" up >/dev/null 2>&1 || continue
-    ip addr show dev "$ifn" 2>/dev/null | awk '/inet6? /{print $2; exit}' | cut -d/ -f1 && return
-  done
-}
-# best-guess peer inner IP across known tunnel ifaces
-speed_peer_ip() {
-  local ifn p
-  for ifn in tun0 gre1 ipip1 sit1 gre6 ip6t1 wg0; do
-    ip link show "$ifn" up >/dev/null 2>&1 || continue
-    p=$(iface_peer_ip "$ifn"); [[ -n $p ]] && { echo "$p"; return; }
-  done
-}
-# parse the receiver Mbit/s from iperf3 -f m output (prefer the SUM line with -P)
-speed_parse() { awk '/receiver/{v=$(NF-2)} /SUM/&&/receiver/{s=$(NF-2)} END{print (s!="" ? s : v)}'; }
-
-# bh_remote_host — the backhaul server's public IP from this host's client.toml
-bh_remote_host() {
-  local f="$DIR/backhaul/client.toml" hp
-  [[ -f $f ]] || return 0
-  hp=$(grep -oE '"[^"]+:[0-9]+"' "$f" | head -1 | tr -d '"')
-  [[ -n $hp ]] || return 0
-  case "$hp" in
-    \[*\]:*) hp=${hp%]*}; echo "${hp#[}";;   # [ipv6]:port
-    *:*)     echo "${hp%:*}";;
-    *)       echo "$hp";;
-  esac
-}
-
-# close_firewall <proto> <port...> — reverse of open_firewall (best effort)
-close_firewall() {
-  local proto="$1"; shift; local p
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-    for p in "$@"; do ufw delete allow "$p/$proto" >/dev/null 2>&1 || true; done
-  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    for p in "$@"; do firewall-cmd --permanent --remove-port="$p/$proto" >/dev/null 2>&1 || true; done
-    firewall-cmd --reload >/dev/null 2>&1 || true
-  fi
-}
-
-speed_screen() {
+# -------------------------------------------------------- doctor / self-test
+doctor_screen() {
   ui_banner
-  ui_title "تست سرعت روی تانل"
-  echo -e "  ${U_D}سرعت واقعی داده بین دو سرور را اندازه می‌گیرد (با iperf3).${U_0}"
+  ui_title "عیب‌یابی سریع (Doctor)"
+  echo -e "  ${U_D}بدون وابستگی به پینگ — TCP و وضعیت سرویس چک می‌شود${U_0}"
+  echo
 
-  # Interface tunnels (openvpn/gre/…) have an inner IP → measure straight over it.
-  # Backhaul has no inner IP → measure the public path (the tunnel's practical ceiling).
-  local iface_peer bh_role="" bh_peer="" mode=""
-  iface_peer=$(speed_peer_ip)
-  [[ -f $DIR/backhaul/server.toml ]] && bh_role=server
-  [[ -f $DIR/backhaul/client.toml ]] && { bh_role=client; bh_peer=$(bh_remote_host); }
+  local ok=0 warn=0
 
-  if [[ -n $iface_peer ]]; then
-    mode=iface
-  elif [[ -n $bh_role ]]; then
-    mode=path
-    echo
-    ui_info "تانل Backhaul شناسایی شد — سرعت از مسیر عمومی بین دو سرور سنجیده می‌شود (سقف عملی تانل)."
-    if [[ $bh_role == server ]]; then
-      echo -e "  ${U_D}این «سرور اول» است → اینجا «گیرنده»؛ «فرستنده» را روی سرور دوم بزنید.${U_0}"
+  # 1) units
+  echo -e "  ${U_B}۱) سرویس‌ها${U_0}"
+  local u any=0
+  while read -r u; do
+    [[ -n $u ]] || continue; any=1
+    if systemctl is-active --quiet "$u" 2>/dev/null; then
+      echo -e "     ${U_G}✔${U_0} $u فعال"
+      ok=$((ok+1))
     else
-      echo -e "  ${U_D}این «سرور دوم» است → اینجا «فرستنده»؛ «گیرنده» را روی سرور اول بزنید.${U_0}"
+      echo -e "     ${U_R}✘${U_0} $u متوقف"
+      warn=$((warn+1))
+    fi
+  done < <(tunnel_units)
+  [[ $any == 0 ]] && echo -e "     ${U_Y}●${U_0} هیچ تانلی نصب نشده"
+
+  # 2) tunlink configs
+  echo
+  echo -e "  ${U_B}۲) تنظیمات TunLink${U_0}"
+  if [[ -f $DIR/tunlink/server.toml ]]; then
+    echo -e "     ${U_G}✔${U_0} server.toml"
+    grep -E 'bind_addr|transport|obfuscate|ports' "$DIR/tunlink/server.toml" 2>/dev/null | sed 's/^/       /'
+  elif [[ -f $DIR/tunlink/client.toml ]]; then
+    echo -e "     ${U_G}✔${U_0} client.toml"
+    grep -E 'remote_addr|remote_addrs|transport|obfuscate' "$DIR/tunlink/client.toml" 2>/dev/null | sed 's/^/       /'
+  else
+    echo -e "     ${U_Y}●${U_0} فایل تنظیمات tunlink پیدا نشد"
+  fi
+
+  # 3) TCP to peer (client side)
+  echo
+  echo -e "  ${U_B}۳) تست TCP تا سرور مقابل (بدون پینگ)${U_0}"
+  local peer port
+  if [[ -f $DIR/tunlink/client.toml ]]; then
+    local line
+    line=$(grep -E 'remote_addr\s*=' "$DIR/tunlink/client.toml" 2>/dev/null | head -1 || true)
+    if [[ $line =~ \"([^:\"]+):([0-9]+)\" ]]; then
+      peer="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+    else
+      line=$(grep -oE '"[^"]+:[0-9]+"' "$DIR/tunlink/client.toml" 2>/dev/null | head -1 | tr -d '"')
+      peer="${line%%:*}"; port="${line##*:}"
+    fi
+    if [[ -n $peer && -n $port ]]; then
+      if timeout 3 bash -c "echo >/dev/tcp/${peer}/${port}" 2>/dev/null; then
+        echo -e "     ${U_G}✔${U_0} TCP به ${peer}:${port} برقرار است"
+        ok=$((ok+1))
+      else
+        echo -e "     ${U_R}✘${U_0} TCP به ${peer}:${port} برقرار نشد (فایروال/پورت/آدرس را چک کنید)"
+        warn=$((warn+1))
+      fi
+    else
+      echo -e "     ${U_Y}●${U_0} آدرس peer از config خوانده نشد"
     fi
   else
-    ui_info "هیچ تانل فعالی پیدا نشد. اول یک تانل بسازید، بعد تست سرعت را بزنید."
-    ui_pause; return 0
+    echo -e "     ${U_D}(فقط روی سمت کلاینت معنی دارد)${U_0}"
+  fi
+
+  # 4) control channel recent logs
+  echo
+  echo -e "  ${U_B}۴) کانال کنترل (لاگ ۲ دقیقه اخیر)${U_0}"
+  if systemctl list-units --type=service --all 2>/dev/null | grep -q abtunnel-tunlink; then
+    if journalctl -u abtunnel-tunlink --since "2 min ago" --no-pager 2>/dev/null | grep -qi 'control channel established'; then
+      echo -e "     ${U_G}✔${U_0} control channel اخیراً برقرار شده"
+      ok=$((ok+1))
+    elif journalctl -u abtunnel-tunlink --since "2 min ago" --no-pager 2>/dev/null | grep -Eqi 'error|failed|timeout|refused'; then
+      echo -e "     ${U_R}✘${U_0} خطا در لاگ اخیر:"
+      journalctl -u abtunnel-tunlink --since "2 min ago" --no-pager 2>/dev/null | grep -Ei 'error|failed|timeout|refused' | tail -5 | sed 's/^/       /'
+      warn=$((warn+1))
+    else
+      echo -e "     ${U_Y}●${U_0} پیام واضحی در ۲ دقیقه اخیر نیست — سرویس را یک‌بار ری‌استارت کنید"
+    fi
+  else
+    echo -e "     ${U_D}سرویس abtunnel-tunlink ثبت نشده${U_0}"
+  fi
+
+  # 5) failover
+  echo
+  echo -e "  ${U_B}۵) سوئیچ خودکار${U_0}"
+  if systemctl is-active --quiet abtunnel-failover 2>/dev/null; then
+    echo -e "     ${U_G}✔${U_0} failover فعال — تانل فعلی: $(cat $DIR/failover/active 2>/dev/null || echo '?')"
+  else
+    echo -e "     ${U_D}○ خاموش (از منو می‌توانید روشن کنید)${U_0}"
   fi
 
   echo
-  ui_opt 1 "گیرنده (این سرور منتظر بماند)" "iperf سرور"
-  ui_opt 2 "فرستنده (شروع تست)"            "تست را اجرا می‌کند"
-  ui_opt 0 "برگشت"
-  local c; choose c 2 || return 0
-  [[ $c == 0 ]] && return 0
-
-  if ! command -v iperf3 >/dev/null 2>&1; then
-    ui_info "در حال نصب iperf3..."
-    apt_install iperf3 || { ui_err "نصب iperf3 ناموفق بود"; ui_pause; return 0; }
-  fi
-
-  if [[ $c == 1 ]]; then
-    # listener
-    local bind="" opened=0
-    if [[ $mode == iface ]]; then
-      bind=$(speed_local_ip)
-    else
-      open_firewall tcp "$SPEED_PORT"; opened=1
-    fi
-    ui_ok "گیرنده آماده شد${bind:+ (روی $bind)} — پورت $SPEED_PORT"
-    echo -e "  ${U_D}حالا روی سرور دیگر «فرستنده» را اجرا کنید. بعد از پایان، اینجا Enter بزنید.${U_0}"
-    local pid
-    iperf3 -s ${bind:+-B "$bind"} -p "$SPEED_PORT" >>"$LOGFILE" 2>&1 &
-    pid=$!
-    read -rp "  ↵  Enter برای توقف گیرنده " _ || true
-    kill "$pid" 2>/dev/null || true
-    (( opened )) && close_firewall tcp "$SPEED_PORT"
-    ui_ok "گیرنده متوقف شد."
-    ui_pause
+  ui_line
+  if (( warn == 0 )); then
+    ui_ok "جمع‌بندی: وضعیت خوب به نظر می‌رسد ($ok مورد مثبت)."
   else
-    # tester
-    local ip prefill
-    if [[ $mode == iface ]]; then
-      prefill=$iface_peer
-      ui_info "IP داخلی طرف مقابل روی تانل${prefill:+ (پیشنهاد: $prefill)}:"
-    else
-      prefill=$bh_peer
-      ui_info "IP عمومی سرور مقابل (گیرنده)${prefill:+ (پیشنهاد: $prefill)}:"
-    fi
-    ask ip "IP طرف مقابل" "$prefill" '^[0-9A-Fa-f.:]+$' "یک IP معتبر وارد کنید" || return 0
-    echo; ui_info "در حال تست (چند ثانیه)... مطمئن شوید روی سرور دیگر «گیرنده» فعال است."
-    local p6=""; [[ $ip == *:* ]] && p6="-6"
-    local up down
-    up=$(iperf3 -c "$ip" $p6 -p "$SPEED_PORT" -t 8 -P 4 -f m 2>/dev/null | speed_parse)
-    down=$(iperf3 -c "$ip" $p6 -p "$SPEED_PORT" -t 8 -P 4 -f m -R 2>/dev/null | speed_parse)
-    echo; ui_line
-    if [[ -n $up || -n $down ]]; then
-      local label="روی تانل"; [[ $mode == path ]] && label="مسیر بین دو سرور (سقف عملی تانل backhaul)"
-      ui_ok "${U_B}نتیجه‌ی تست سرعت — $label:${U_0}"
-      echo -e "   ⬆️  ارسال (این سرور → طرف مقابل):   ${U_B}${up:-?} Mbit/s${U_0}"
-      echo -e "   ⬇️  دریافت (طرف مقابل → این سرور):  ${U_B}${down:-?} Mbit/s${U_0}"
-    else
-      ui_err "تست انجام نشد."
-      echo -e "  ${U_B}بررسی کنید:${U_0}"
-      echo -e "   • روی سرور دیگر «گیرنده» فعال باشد"
-      if [[ $mode == path ]]; then
-        echo -e "   • پورت $SPEED_PORT بین دو سرور باز باشد (فایروال دیتاسنتر سرور گیرنده)"
-      else
-        echo -e "   • تانل بالا باشد (منو → وضعیت تانل‌ها) و $ip با ping جواب بده"
-      fi
-    fi
-    ui_pause
+    ui_err "جمع‌بندی: $warn مورد نیاز به بررسی دارد، $ok مورد مثبت."
   fi
+  ui_pause
 }
 
+restart_tunnel_screen() {
+  ui_banner
+  ui_title "ری‌استارت تانل"
+  local units=() u i=1
+  while read -r u; do [[ -n $u ]] && units+=("$u"); done < <(tunnel_units)
+  if [[ ${#units[@]} -eq 0 ]]; then ui_info "تانلی نیست."; ui_pause; return 0; fi
+  for u in "${units[@]}"; do
+    local st="متوقف"; systemctl is-active --quiet "$u" 2>/dev/null && st="فعال"
+    ui_opt "$i" "$(unit_label "$u")" "$st"
+    i=$((i+1))
+  done
+  ui_opt 0 "برگشت"
+  local c; choose c "${#units[@]}" || return 0
+  [[ $c == 0 ]] && return 0
+  u=${units[$((c-1))]}
+  ui_info "در حال ری‌استارت $u ..."
+  if systemctl restart "$u" 2>/dev/null; then
+    sleep 1
+    systemctl is-active --quiet "$u" && ui_ok "ری‌استارت شد و فعال است." || ui_err "ری‌استارت شد ولی هنوز فعال نیست."
+  else
+    ui_err "ری‌استارت ناموفق"
+  fi
+  ui_pause
+}
+
+hard_network_hint() {
+  # kept as alias
+  hard_network_profile
+}
+
+# One-click hard-network profile: HTTPS camouflage + shape + failover
+hard_network_profile() {
+  ui_banner
+  ui_title "پروفایل یک‌کلیکی شبکه سخت"
+  echo -e "  ${U_D}HTTPS Camouflage + پدینگ پکت + پورت جدا + Failover${U_0}"
+  echo
+
+  if ! confirm "روی این سرور به‌عنوان سرور اول ساخته شود؟"; then
+    ui_info "لغو شد. اگر کلاینت هستید فقط توکن را Paste کنید."; ui_pause; return 0
+  fi
+
+  local pub tport users_ports
+  pub=$(detect_pubip)
+  if [[ -z $pub ]] || ! confirm "IP عمومی: ${pub:-?} — درست است؟"; then
+    ask pub "IP عمومی این سرور" "" '^[0-9A-Fa-f.:]+$' || return 0
+  fi
+
+  tport=443
+  users_ports="2096,8080"
+  echo -e "  ${U_D}پیش‌فرض‌ها:${U_0}"
+  echo -e "   • transport: ${U_B}https${U_0} (Camouflage)"
+  echo -e "   • پورت تانل: ${U_B}${tport}${U_0}"
+  echo -e "   • پورت پنل: ${U_B}${users_ports}${U_0}"
+  echo -e "   • obfuscate/shape: ${U_B}روشن${U_0}"
+  if ! confirm "با همین پیش‌فرض‌ها ادامه؟"; then
+    ask tport "پورت تانل" "443" '^[0-9]{1,5}$' || return 0
+    ask users_ports "پورت پنل (کاما جدا)" "2096,8080" '^[0-9A-Za-z.:=_,/-]+$' || return 0
+  fi
+
+  ui_info "در حال ساخت..."
+  local ok=0
+  TOKEN_LABEL="hardnet" BH_QUIET=1 PUBLIC_IP="$pub" ACCEPT_PORT="$tport" PSK="" TRANSPORT="https" PORTS="$users_ports" \
+    tunlink_server >>"$LOGFILE" 2>&1 && ok=1 || ok=0
+
+  if [[ $ok == 1 ]]; then
+    open_firewall tcp "$tport" 2096 8080 2>/dev/null || true
+    # enable failover
+    local helper=""
+    for p in "$SCRIPT_DIR/failover.sh" /opt/tunxall/failover.sh /usr/local/lib/tunxall/failover.sh; do
+      [[ -x $p ]] && helper=$p && break
+    done
+    [[ -n $helper ]] && bash "$helper" install >>"$LOGFILE" 2>&1 || true
+
+    ui_ok "پروفایل شبکه سخت آماده است."
+    if [[ -s $DIR/tunlink/connect.token ]]; then
+      ui_token_box "توکن — روی سرور دوم Paste کنید" "$(cat $DIR/tunlink/connect.token)"
+    fi
+    echo -e "  ${U_D}Failover هم فعال شد. وضعیت: منو ← عیب‌یابی${U_0}"
+  else
+    ui_err "ساخت ناموفق بود — جزئیات: $LOGFILE"
+  fi
+  ui_pause
+}
+
+webpanel_screen() {
+  ui_banner
+  ui_title "پنل وب وضعیت"
+  echo -e "  ${U_D}صفحه وضعیت محلی (سرویس‌ها، توکن‌ها، failover)${U_0}"
+  echo
+  ui_opt 1 "نصب و روشن کردن پنل" "پورت 9090"
+  ui_opt 2 "وضعیت پنل"
+  ui_opt 3 "خاموش کردن"
+  ui_opt 0 "برگشت"
+  local c; choose c 3 || return 0
+  local helper=""
+  for p in "$SCRIPT_DIR/webpanel.sh" /opt/tunxall/webpanel.sh /usr/local/lib/tunxall/webpanel.sh; do
+    [[ -x $p ]] && helper=$p && break
+  done
+  case "$c" in
+    1)
+      [[ -n $helper ]] || { ui_err "webpanel.sh پیدا نشد"; ui_pause; return 0; }
+      ask WEB_PORT "پورت پنل وب" "9090" '^[0-9]{1,5}$' || return 0
+      if WEB_PORT="$WEB_PORT" bash "$helper" install >>"$LOGFILE" 2>&1; then
+        local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        ui_ok "پنل فعال شد:  http://${ip:-0.0.0.0}:${WEB_PORT}/"
+        open_firewall tcp "$WEB_PORT" 2>/dev/null || true
+      else
+        ui_err "نصب ناموفق — $LOGFILE"
+      fi
+      ui_pause
+      ;;
+    2)
+      [[ -n $helper ]] && bash "$helper" status || ui_info "نصب نشده"
+      ui_pause
+      ;;
+    3)
+      [[ -n $helper ]] && bash "$helper" stop
+      ui_ok "خاموش شد."
+      ui_pause
+      ;;
+    0) return 0;;
+  esac
+}
+
+token_vault_screen() {
+  ui_banner
+  ui_title "صندوق توکن‌ها (چند توکن همزمان)"
+  mkdir -p "$DIR/tokens"
+  local files=() f i=1
+  # include legacy single tokens
+  [[ -s $DIR/tunlink/connect.token ]] && files+=("$DIR/tunlink/connect.token")
+  [[ -s $DIR/ovpn-connect.token ]] && files+=("$DIR/ovpn-connect.token")
+  for f in "$DIR"/tokens/*.token; do [[ -f $f ]] && files+=("$f"); done
+
+  if [[ ${#files[@]} -eq 0 ]]; then
+    ui_info "هنوز توکنی ذخیره نشده. با «ساخت تانل» توکن ساخته می‌شود."
+    ui_pause; return 0
+  fi
+
+  echo -e "  ${U_D}همه توکن‌های ذخیره‌شده:${U_0}"
+  for f in "${files[@]}"; do
+    local label trn
+    label=$(basename "$f")
+    trn=""
+    [[ -f ${f%.token}.meta ]] && trn=$(grep '^transport=' "${f%.token}.meta" 2>/dev/null | cut -d= -f2-)
+    ui_opt "$i" "$label" "${trn}"
+    i=$((i+1))
+  done
+  ui_opt 0 "برگشت"
+  local c; choose c "${#files[@]}" || return 0
+  [[ $c == 0 ]] && return 0
+  f=${files[$((c-1))]}
+  ui_token_box "توکن: $(basename "$f")" "$(cat "$f")"
+  echo
+  if confirm "این توکن را به‌عنوان توکن فعال (connect.token) کپی کنم؟"; then
+    mkdir -p "$DIR/tunlink"
+    cp -f "$f" "$DIR/tunlink/connect.token"
+    chmod 600 "$DIR/tunlink/connect.token"
+    ui_ok "به‌عنوان توکن فعال ذخیره شد."
+  fi
+  ui_pause
+}
+
+
+
+
+proxy_settings_screen() {
+  ui_banner
+  ui_title "تنظیمات پروکسی تانل"
+  echo -e "  ${U_D}پروکسی بالادستی فقط برای سمت کلاینت: اتصال به سرور از داخل SOCKS/HTTP${U_0}"
+  echo
+  echo -e "  ${U_B}الان:${U_0}"
+  if [[ -f $DIR/tunlink/client.toml ]] && grep -q '^proxy' "$DIR/tunlink/client.toml" 2>/dev/null; then
+    grep '^proxy' "$DIR/tunlink/client.toml" | sed 's/^/   /'
+  else
+    echo -e "   ${U_D}پروکسی تنظیم نشده (اتصال مستقیم)${U_0}"
+  fi
+  if [[ -f $DIR/tunlink/client.toml ]] && grep -q '^edge_ip' "$DIR/tunlink/client.toml" 2>/dev/null; then
+    grep '^edge_ip' "$DIR/tunlink/client.toml" | sed 's/^/   /'
+  fi
+  echo
+  ui_opt 1 "تنظیم SOCKS5"           "مثال: socks5://127.0.0.1:1080"
+  ui_opt 2 "تنظیم HTTP CONNECT"     "مثال: http://proxy:8080"
+  ui_opt 3 "تنظیم Edge IP (CDN)"    "TCP به IP لبه، SNI همان دامنه"
+  ui_opt 4 "حذف پروکسی (مستقیم)"
+  ui_opt 5 "اعمال و ری‌استارت کلاینت"
+  ui_opt 0 "برگشت"
+  local c; choose c 5 || return 0
+  case "$c" in
+    1)
+      ask PROXY "آدرس SOCKS5" "socks5://127.0.0.1:1080" '.*' || return 0
+      [[ $PROXY != socks5://* && $PROXY != socks5h://* ]] && PROXY="socks5://$PROXY"
+      ;;
+    2)
+      ask PROXY "آدرس HTTP پروکسی" "http://127.0.0.1:8080" '.*' || return 0
+      [[ $PROXY != http://* && $PROXY != https://* ]] && PROXY="http://$PROXY"
+      ;;
+    3)
+      ask EDGE_IP "Edge IP" "" '^[0-9A-Fa-f.:]+$' || return 0
+      if [[ -f $DIR/tunlink/client.toml ]]; then
+        if grep -q '^edge_ip' "$DIR/tunlink/client.toml"; then
+          sed -i "s|^edge_ip.*|edge_ip = \"$EDGE_IP\"|" "$DIR/tunlink/client.toml"
+        else
+          echo "edge_ip = \"$EDGE_IP\"" >> "$DIR/tunlink/client.toml"
+        fi
+        ui_ok "edge_ip ذخیره شد."
+      else
+        ui_err "client.toml نیست — اول با توکن وصل شوید."
+      fi
+      ui_pause; return 0
+      ;;
+    4)
+      if [[ -f $DIR/tunlink/client.toml ]]; then
+        sed -i '/^proxy\s*=/d' "$DIR/tunlink/client.toml"
+        ui_ok "پروکسی حذف شد."
+      fi
+      ui_pause; return 0
+      ;;
+    5)
+      if systemctl restart abtunnel-tunlink 2>/dev/null; then ui_ok "ری‌استارت شد."; else ui_err "سرویس نیست"; fi
+      ui_pause; return 0
+      ;;
+    0) return 0;;
+  esac
+  # write proxy into client.toml for options 1/2
+  if [[ -n ${PROXY:-} ]]; then
+    if [[ ! -f $DIR/tunlink/client.toml ]]; then
+      ui_err "اول کلاینت را با توکن وصل کنید، بعد پروکسی بگذارید."
+      ui_pause; return 0
+    fi
+    if grep -q '^proxy' "$DIR/tunlink/client.toml"; then
+      sed -i "s|^proxy.*|proxy = \"$PROXY\"|" "$DIR/tunlink/client.toml"
+    else
+      # insert after [client]
+      sed -i "/^\[client\]/a proxy = \"$PROXY\"" "$DIR/tunlink/client.toml"
+    fi
+    ui_ok "پروکسی ذخیره شد: $PROXY"
+    if confirm "الان کلاینت ری‌استارت شود؟"; then
+      systemctl restart abtunnel-tunlink 2>/dev/null && ui_ok "ری‌استارت شد." || ui_err "ری‌استارت ناموفق"
+    fi
+  fi
+  ui_pause
+}
+
+
+# -------------------------------------------------------- main interactive menu
 wizard() {
   [[ $EUID -eq 0 ]] || die "لطفاً با sudo اجرا کنید:  sudo abtunnel"
   touch "$LOGFILE" 2>/dev/null || LOGFILE=/tmp/abtunnel.log
@@ -1728,26 +1904,32 @@ wizard() {
     elif (( active == n )); then echo -e "    ${U_G}● $active تانل فعال${U_0}"
     else echo -e "    ${U_Y}● $active از $n تانل فعال${U_0}"; fi
     ui_line
-    ui_opt 1 "ساخت تانل جدید"           "روی سرور اول — یک توکن می‌دهد"
-    ui_opt 2 "وصل شدن با توکن"          "روی سرور دوم — توکن را Paste کنید"
-    ui_opt 3 "وضعیت تانل‌ها"             "سلامت + سوئیچ خودکار"
-    ui_opt 4 "نمایش دوباره توکن"
-    ui_opt 5 "حذف تانل"
-    ui_opt 6 "سوئیچ خودکار (Failover)"  "اگر قطع شد → تانل بعدی"
-    ui_opt 7 "تست سرعت تانل"            "سرعت واقعی بین دو سرور روی تانل"
-    ui_opt 8 "تنظیمات پیشرفته"
+    ui_opt 1 "ساخت تانل جدید"               "روی سرور اول — یک توکن می‌دهد"
+    ui_opt 2 "وصل شدن با توکن"              "روی سرور دوم — توکن را Paste کنید"
+    ui_opt 3 "وضعیت تانل‌ها"                 "سلامت + سوئیچ خودکار"
+    ui_opt 4 "عیب‌یابی سریع (Doctor)"        "تست TCP بدون پینگ"
+    ui_opt 5 "ری‌استارت تانل"
+    ui_opt 6 "صندوق توکن‌ها"                "چند توکن همزمان"
+    ui_opt 7 "سوئیچ خودکار (Failover)"      "اگر قطع شد → تانل بعدی"
+    ui_opt 8 "پروفایل شبکه سخت (یک‌کلیکی)"  "HTTPS + Shape + Failover"
+    ui_opt 9 "پنل وب وضعیت"                 "صفحه وضعیت روی مرورگر"
+    ui_opt 10 "تنظیمات پروکسی تانل"         "SOCKS5 / HTTP / Edge IP"
+    ui_opt 11 "تنظیمات پیشرفته"
     ui_opt 0 "خروج"
     ui_line
-    local c; choose c 8 || exit 0
+    local c; choose c 11 || exit 0
     case "$c" in
       1) easy_server;;
       2) easy_client;;
       3) status_screen;;
-      4) token_screen;;
-      5) remove_screen;;
-      6) failover_screen;;
-      7) speed_screen;;
-      8) advanced_screen;;
+      4) doctor_screen;;
+      5) restart_tunnel_screen;;
+      6) token_vault_screen;;
+      7) failover_screen;;
+      8) hard_network_profile;;
+      9) webpanel_screen;;
+      10) proxy_settings_screen;;
+      11) advanced_screen;;
       0) ui_clear; exit 0;;
     esac
   done
@@ -1800,11 +1982,23 @@ main() {
     advanced) menu_advanced;;
     connect) cmd_connect "${1:-}";;
     status) cmd_status;;
+    doctor) doctor_screen;;
+    hardnet) hard_network_profile;;
+    proxy) proxy_settings_screen;;
+    webpanel) webpanel_screen;;
+    tokens) token_vault_screen;;
+    restart)
+      # non-interactive restart of tunlink if present
+      if systemctl list-units --type=service --all 2>/dev/null | grep -q abtunnel-tunlink; then
+        systemctl restart abtunnel-tunlink && echo "tunlink restarted" || echo "restart failed"
+      else
+        restart_tunnel_screen
+      fi
+      ;;
     uninstall) cmd_uninstall;;
     down) cmd_down "${1:-}";;
     health) parse_args "$@"; health_install;;
     forward) parse_args "$@"; cmd_forward;;
-    speed)   need_root; speed_screen;;
     stunnel) local role="${1:-}"; shift || true; parse_args "$@"; if [[ $role == server ]]; then stunnel_server; else stunnel_client; fi;;
     ssh)     local role="${1:-}"; shift || true; parse_args "$@"; if [[ $role == server ]]; then ssh_server; else ssh_client; fi;;
     ipsec)   local role="${1:-}"; shift || true; parse_args "$@"; ipsec_setup "$role";;
@@ -1814,8 +2008,8 @@ main() {
     gre6)    local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup gre6 "$role";;
     ip6ip6)  local role="${1:-}"; shift || true; parse_args "$@"; iface_tunnel_setup ip6ip6 "$role";;
     openvpn) local role="${1:-}"; shift || true; parse_args "$@"; if [[ $role == server ]]; then openvpn_server; else openvpn_client; fi;;
-    backhaul) local role="${1:-}"; shift || true; parse_args "$@"; if [[ $role == server ]]; then backhaul_server; else backhaul_client; fi;;
-    *) echo "Usage: $0 {menu|connect <token>|advanced|stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn|backhaul|forward|speed|health|status|down|uninstall} ..."; echo "Easiest:  sudo $0   (opens the menu)"; exit 1;;
+    tunlink) local role="${1:-}"; shift || true; parse_args "$@"; if [[ $role == server ]]; then tunlink_server; else tunlink_client; fi;;
+    *) echo "Usage: $0 {menu|connect <token>|doctor|restart|advanced|stunnel|ssh|ipsec|gre|ipip|sit|gre6|ip6ip6|openvpn|tunlink|forward|health|status|down|uninstall} ..."; echo "Easiest:  sudo $0   (opens the menu)"; exit 1;;
   esac
 }
 main "$@"

@@ -18,6 +18,7 @@ import (
 type TcpMuxConfig struct {
 	BindAddr         string
 	Token            string
+	Obfuscate        bool
 	Ports            []string
 	Nodelay          bool
 	KeepAlive        time.Duration
@@ -45,6 +46,7 @@ func NewTcpMuxServer(parentCtx context.Context, config *TcpMuxConfig, logger *lo
 		config.MuxCon = 8
 	}
 	cs := newControlServer(ctx, config.Token, config.Heartbeat, config.ChannelSize, logger)
+	cs.obfuscate = config.Obfuscate
 	return &TcpMuxTransport{
 		controlServer: cs,
 		config:        config,
@@ -225,7 +227,7 @@ func (s *TcpMuxTransport) muxHandleLoop() {
 				localConn.conn.Close()
 				continue
 			}
-			go handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, localConn.conn, stream, s.logger, 0, false)
+			go handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, localConn.conn, stream, s.logger, 0, false, s.config.Obfuscate)
 		}
 	}
 }

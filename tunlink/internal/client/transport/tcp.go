@@ -17,6 +17,7 @@ import (
 type TcpConfig struct {
 	RemoteAddr     string
 	Token          string
+	Obfuscate      bool
 	KeepAlive      time.Duration
 	RetryInterval  time.Duration
 	DialTimeOut    time.Duration
@@ -26,6 +27,7 @@ type TcpConfig struct {
 	MSS            int
 	SO_RCVBUF      int
 	SO_SNDBUF      int
+	Proxy          string
 }
 
 type TcpTransport struct {
@@ -55,7 +57,7 @@ func (c *TcpTransport) Stop() {
 }
 
 func (c *TcpTransport) dialControl(ctx context.Context) (net.Conn, error) {
-	conn, err := network.TcpDialer(ctx, c.config.RemoteAddr, "", c.config.DialTimeOut, c.config.KeepAlive, true, 3, 0, 0, 0)
+	conn, err := network.DialTCP(ctx, c.config.RemoteAddr, c.config.Proxy, c.config.DialTimeOut, c.config.KeepAlive, true)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +128,7 @@ func (c *TcpTransport) tunnelDialer(sess *clientSession) {
 	if sess.ctx.Err() != nil {
 		return
 	}
-	conn, err := network.TcpDialer(sess.ctx, c.config.RemoteAddr, "", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, 3, c.config.SO_RCVBUF, c.config.SO_SNDBUF, c.config.MSS)
+	conn, err := network.DialTCP(sess.ctx, c.config.RemoteAddr, c.config.Proxy, c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay)
 	if err != nil {
 		c.logger.Debugf("tunnel dial failed: %v", err)
 		return
@@ -167,5 +169,5 @@ func (c *TcpTransport) localDialer(tunnelConn net.Conn, addr string, port int) {
 		return
 	}
 	c.logger.Debugf("connected to local %s", addr)
-	handlers.TCPConnectionHandler(c.ctx, false, tunnelConn, localConn, c.logger, port, false)
+	handlers.TCPConnectionHandler(c.ctx, false, localConn, tunnelConn, c.logger, port, false, c.config.Obfuscate)
 }

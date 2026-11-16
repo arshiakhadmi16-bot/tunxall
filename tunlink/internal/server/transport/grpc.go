@@ -18,6 +18,7 @@ import (
 type GrpcConfig struct {
 	BindAddr    string
 	Token       string
+	Obfuscate   bool
 	Ports       []string
 	Nodelay     bool
 	KeepAlive   time.Duration
@@ -39,6 +40,7 @@ type GrpcTransport struct {
 func NewGRPCServer(parentCtx context.Context, config *GrpcConfig, logger *logrus.Logger) *GrpcTransport {
 	ctx, cancel := context.WithCancel(parentCtx)
 	cs := newControlServer(ctx, config.Token, config.Heartbeat, config.ChannelSize, logger)
+	cs.obfuscate = config.Obfuscate
 	return &GrpcTransport{
 		controlServer: cs,
 		config:        config,

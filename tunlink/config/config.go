@@ -13,6 +13,7 @@ const (
 	UDP    TransportType = "udp"
 	GRPC   TransportType = "grpc"  // gRPC over plaintext HTTP/2 (h2c)
 	GRPCS  TransportType = "grpcs" // gRPC over TLS
+	HTTPS  TransportType = "https" // WSS + decoy HTML page (max camouflage)
 )
 
 // ServerConfig represents the configuration for the server.
@@ -42,6 +43,7 @@ type ServerConfig struct {
 	SO_RCVBUF        int           `toml:"so_rcvbuf"`
 	SO_SNDBUF        int           `toml:"so_sndbuf"`
 	ProxyProtocol    bool          `toml:"proxy_protocol"`
+	Obfuscate        bool          `toml:"obfuscate"` // random packet padding (anti size-fingerprint)
 }
 
 // ClientConfig represents the configuration for the client.
@@ -70,16 +72,18 @@ type ClientConfig struct {
 	DialTimeout      int           `toml:"dial_timeout"`
 	AggressivePool   bool          `toml:"aggressive_pool"`
 	EdgeIP           string        `toml:"edge_ip"`
+	Proxy            string        `toml:"proxy"` // upstream socks5:// or http:// for client dial
 	SkipOptz         bool          `toml:"skip_optz"`
 	MSS              int           `toml:"mss"`
 	SO_RCVBUF        int           `toml:"so_rcvbuf"`
 	SO_SNDBUF        int           `toml:"so_sndbuf"`
 
 	// Auto server selection
-	HealthCheckInterval int `toml:"health_check_interval"` // seconds, default 30
-	HealthCheckTimeout  int `toml:"health_check_timeout"`  // seconds, default 3
-	MinSuccessRate      int `toml:"min_success_rate"`      // percent 0-100, default 70
-	SwitchThresholdMs   int `toml:"switch_threshold_ms"`   // only switch if better by this RTT (ms), default 50
+	HealthCheckInterval int  `toml:"health_check_interval"` // seconds, default 30
+	HealthCheckTimeout  int  `toml:"health_check_timeout"`  // seconds, default 3
+	MinSuccessRate      int  `toml:"min_success_rate"`      // percent 0-100, default 70
+	SwitchThresholdMs   int  `toml:"switch_threshold_ms"`   // only switch if better by this RTT (ms), default 50
+	Obfuscate           bool `toml:"obfuscate"`             // random packet padding
 }
 
 // Config represents the complete configuration.

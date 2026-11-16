@@ -34,6 +34,7 @@ func (s *Server) Start() {
 		cfg := &transport.TcpConfig{
 			BindAddr:      s.config.BindAddr,
 			Token:         s.config.Token,
+			Obfuscate:     s.config.Obfuscate,
 			Ports:         s.config.Ports,
 			Nodelay:       s.config.Nodelay,
 			KeepAlive:     time.Duration(s.config.Keepalive) * time.Second,
@@ -52,6 +53,7 @@ func (s *Server) Start() {
 		cfg := &transport.TcpMuxConfig{
 			BindAddr:         s.config.BindAddr,
 			Token:            s.config.Token,
+			Obfuscate:        s.config.Obfuscate,
 			Ports:            s.config.Ports,
 			Nodelay:          s.config.Nodelay,
 			KeepAlive:        time.Duration(s.config.Keepalive) * time.Second,
@@ -67,10 +69,11 @@ func (s *Server) Start() {
 		srv := transport.NewTcpMuxServer(s.ctx, cfg, s.logger)
 		go srv.Start()
 
-	case config.WS, config.WSS:
+	case config.WS, config.WSS, config.HTTPS:
 		cfg := &transport.WsConfig{
 			BindAddr:    s.config.BindAddr,
 			Token:       s.config.Token,
+			Obfuscate:   s.config.Obfuscate,
 			Ports:       s.config.Ports,
 			Nodelay:     s.config.Nodelay,
 			KeepAlive:   time.Duration(s.config.Keepalive) * time.Second,
@@ -87,6 +90,7 @@ func (s *Server) Start() {
 		cfg := &transport.GrpcConfig{
 			BindAddr:    s.config.BindAddr,
 			Token:       s.config.Token,
+			Obfuscate:   s.config.Obfuscate,
 			Ports:       s.config.Ports,
 			Nodelay:     s.config.Nodelay,
 			KeepAlive:   time.Duration(s.config.Keepalive) * time.Second,

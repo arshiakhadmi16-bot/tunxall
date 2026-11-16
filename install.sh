@@ -4,10 +4,10 @@
 #   curl -fsSL https://raw.githubusercontent.com/arshiakhadmi16-bot/tunxall/main/install.sh | sudo bash
 #
 # Installs into /opt/tunxall and creates the global commands:
-#   abtunnel   -> tunnel setup menu (backhaul / openvpn / gre / wireguard / ...)
+#   abtunnel   -> tunnel setup menu (tunlink / openvpn / gre / wireguard / ...)
 #   netcheck   -> path & firewall diagnostics
 #   wg-tunnel  -> WireGuard link
-# The backhaul program is downloaded prebuilt (no Go needed); building from
+# The tunlink program is downloaded prebuilt (no Go needed); building from
 # source is only a fallback.
 set -euo pipefail
 
@@ -48,12 +48,13 @@ fi
 
 # --- scripts
 mkdir -p "$DEST" "$LIB"
-for f in abtunnel.sh netcheck.sh wg-tunnel.sh backhaul-helper.sh failover.sh; do
+for f in abtunnel.sh netcheck.sh wg-tunnel.sh tunlink-helper.sh failover.sh webpanel.sh; do
   curl -fsSL --retry 3 "$BASE/$f" -o "$DEST/$f.new" || die "download failed: $f (check this server's internet access)"
   mv -f "$DEST/$f.new" "$DEST/$f"; chmod +x "$DEST/$f"
 done
-cp -f "$DEST/backhaul-helper.sh" "$LIB/backhaul-helper.sh"
-[[ -f $DEST/failover.sh ]] && cp -f "$DEST/failover.sh" "$LIB/failover.sh" || true
+cp -f "$DEST/tunlink-helper.sh" "$LIB/tunlink-helper.sh"
+[[ -f $DEST/failover.sh ]] && cp -f "$DEST/failover.sh" "$LIB/failover.sh"
+[[ -f $DEST/webpanel.sh ]] && cp -f "$DEST/webpanel.sh" "$LIB/webpanel.sh"
 ok "Downloaded tunxall scripts"
 
 declare -A MAP=( [abtunnel]=abtunnel.sh [netcheck]=netcheck.sh [wg-tunnel]=wg-tunnel.sh )
@@ -63,23 +64,23 @@ for name in "${!MAP[@]}"; do
 done
 ok "Created commands: abtunnel, netcheck, wg-tunnel"
 
-# --- backhaul program: prebuilt binary first, build from source only as a fallback
+# --- tunlink program: prebuilt binary first, build from source only as a fallback
 # shellcheck source=/dev/null
-source "$DEST/backhaul-helper.sh"
+source "$DEST/tunlink-helper.sh"
 mkdir -p "$BH_DIR"
 if [[ -x $BH_BIN ]] && [[ -z ${TUNXALL_REINSTALL:-} ]]; then
-  ok "Backhaul already installed"
+  ok "TunLink already installed"
 elif bh_download_release >>"$LOGFILE" 2>&1; then
-  ok "Downloaded backhaul ($(bh_arch))"
+  ok "Downloaded tunlink ($(bh_arch))"
 else
-  warn "No prebuilt backhaul for this server — building it from source (one time, a few minutes)..."
-  rm -rf "$DEST/backhaul"
+  warn "No prebuilt tunlink for this server — building it from source (one time, a few minutes)..."
+  rm -rf "$DEST/tunlink"
   if curl -fsSL "https://codeload.github.com/$REPO/tar.gz/$BRANCH" \
-      | tar -xz -C "$DEST" --strip-components=1 --wildcards '*/backhaul/*' \
+      | tar -xz -C "$DEST" --strip-components=1 --wildcards '*/tunlink/*' \
      && bh_build_from_source >>"$LOGFILE" 2>&1; then
-    ok "Built backhaul from source"
+    ok "Built tunlink from source"
   else
-    warn "Backhaul is not available yet (details: $LOGFILE). Other tunnel types still work."
+    warn "TunLink is not available yet (details: $LOGFILE). Other tunnel types still work."
   fi
 fi
 

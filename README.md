@@ -16,14 +16,8 @@ No obfuscation and no traffic disguising — these are plain, standard transport
 curl -fsSL https://raw.githubusercontent.com/arshiakhadmi16-bot/tunxall/main/install.sh | sudo bash
 ```
 
-منو خودش باز می‌شه. گزینه‌ی **`[1] ساخت تانل جدید`** رو بزن. اول ازت می‌پرسه:
-
-1. **نسخه IP:** IPv4 یا IPv6
-2. **پروتکل:** **هوشمند** (خودش بهترین پورت و پروتکل رو انتخاب و راه‌اندازی می‌کنه) یا **دستی**
-
-برای بقیه‌ی سؤال‌ها فقط **Enter** بزن (پیش‌فرض‌ها مناسب‌ان). آخرش یه **توکن** نشون می‌ده؛ کپی‌اش کن.
-
-> حالت **هوشمند**: اولین پورت آزاد رو (با ترجیح پورت‌هایی که `netcheck` باز گزارش کرده و پورت‌های شبیه‌HTTPS مثل 443) تست و انتخاب می‌کنه؛ روی 443 از gRPC+TLS (شبیه HTTPS) و در غیر این‌صورت از tcpmux استفاده می‌کنه. IP عمومی (v4/v6)، فوروارد پورت و همه‌چیز رو هم خودش انجام می‌ده.
+منو خودش باز می‌شه. گزینه‌ی **`[1] ساخت تانل جدید`** رو بزن و برای سؤال‌ها فقط **Enter** بزن (پیش‌فرض‌ها مناسب‌ان).
+آخرش یه **توکن** نشون می‌ده؛ کپی‌اش کن.
 
 ### قدم ۲ — روی سرور دوم
 
@@ -42,22 +36,9 @@ curl -fsSL https://raw.githubusercontent.com/arshiakhadmi16-bot/tunxall/main/ins
 - نیازی به نصب Go یا چیز دیگه‌ای نیست؛ همه‌چیز خودکار نصب می‌شه.
 - اگه فایروال `ufw` یا `firewalld` روشن باشه، پورت‌ها خودکار باز می‌شن. (فایروال دیتاسنتر رو خودت باید باز کنی.)
 - تانل‌ها با ریبوت یا قطعی اینترنت **خودشون دوباره وصل می‌شن** (keepalive و تشخیص قطعی سریع‌تر؛ قطعیِ کامل تا ~۲ دقیقه شناسایی می‌شه).
-- انواع اتصال: Backhaul TCP (پیشنهادی)، **TCP مالتی‌پلکس** (چند کاربر روی یک اتصال)، gRPC، gRPC+TLS، WebSocket، OpenVPN — و در «تنظیمات پیشرفته»: GRE، IPIP، WireGuard، SSH، Stunnel، IPsec و …
+- انواع اتصال: TunLink TCP (پیشنهادی)، **TCP مالتی‌پلکس** (چند کاربر روی یک اتصال)، gRPC، gRPC+TLS، WebSocket، OpenVPN — و در «تنظیمات پیشرفته»: GRE، IPIP، WireGuard، SSH، Stunnel، IPsec و …
 - اتصال‌های شبیه‌HTTPS (gRPC+TLS / WebSocket) به‌صورت پیش‌فرض روی پورت **۴۴۳** تنظیم می‌شن.
 - **MTU/MSS خودکار:** برای GRE/IPIP/OpenVPN اندازه‌ی پکت از روی مسیر واقعی تنظیم می‌شه تا تانل کند نشه یا نصفه‌کاره قطع نشه.
-
-### تست سرعت روی تانل
-
-بعد از بالا آمدن تانل، سرعت واقعی داده بین دو سرور را از داخل تانل اندازه بگیر:
-
-```
-منو → [7] تست سرعت تانل
-```
-
-روی یک سرور **گیرنده** و روی سرور دیگر **فرستنده** را بزن؛ سرعت ارسال و دریافت (Mbit/s) را نشان می‌دهد. (با iperf3؛ خودکار نصب می‌شود.)
-
-- **تانل‌های اینترفیسی** (OpenVPN/GRE/IPIP/WireGuard): مستقیماً روی IP داخلی تانل سنجیده می‌شود.
-- **Backhaul** (که IP داخلی ندارد): سرعت مسیر عمومی بین دو سرور سنجیده می‌شود که سقف عملی تانل است؛ گیرنده را روی «سرور اول» و فرستنده را روی «سرور دوم» بزن (IP خودکار پیشنهاد می‌شود).
 
 ### پیدا کردن بهترین پورت (اختیاری)
 
@@ -84,7 +65,7 @@ sudo abtunnel connect <TOKEN>
 | Command | Purpose |
 |--------|---------|
 | `netcheck`  | Measure which TCP/UDP ports, ICMP, MTU, throughput and connection stability pass between A and B. Measurement only. |
-| `abtunnel`  | Friendly menu to create a tunnel (token-based, 2 steps) — backhaul, openvpn, gre, ipip, wireguard, ssh, stunnel, ipsec, … |
+| `abtunnel`  | Friendly menu to create a tunnel (token-based, 2 steps) — tunlink, openvpn, gre, ipip, wireguard, ssh, stunnel, ipsec, … |
 | `wg-tunnel` | A standard WireGuard link, if you prefer that transport. |
 
 All tunnels run under `systemd` with `Restart=always`, so a single transport
@@ -138,11 +119,11 @@ sudo abtunnel down <stunnel|ssh|ipsec>
 - **ip6ip6:** IPv6-in-IPv6 (IP داخلی `fd40::x`).
 - **openvpn:** تانل point-to-point با static key و AES-256 روی UDP.
 - **WireGuard:** توی `wg-tunnel` جداگانه.
-- **backhaul:** reverse tunnel با transportهای `tcp` / `tcpmux` / `ws` / `wss` / **`grpc`** / **`grpcs`**.
+- **tunlink:** reverse tunnel با transportهای `tcp` / `tcpmux` / `ws` / `wss` / **`grpc`** / **`grpcs`**.
   - `grpc` = gRPC روی HTTP/2 بدون TLS (h2c)، `grpcs` = gRPC روی TLS (گواهی self-signed خودکار ساخته می‌شه).
   - همه‌ی اتصال‌ها (کنترل + دیتا) به‌صورت streamهای جدا روی **یک** اتصال HTTP/2 می‌رن.
-  - مثال: `sudo abtunnel backhaul server --transport grpc --accept-port 3080 --ports "443,8080"`
-    و روی کلاینت: `sudo abtunnel backhaul client --peer <SERVER_IP>:3080 --psk <TOKEN> --transport grpc`
+  - مثال: `sudo abtunnel tunlink server --transport grpc --accept-port 3080 --ports "443,8080"`
+    و روی کلاینت: `sudo abtunnel tunlink client --peer <SERVER_IP>:3080 --psk <TOKEN> --transport grpc`
 
 > نکته‌ی مهم: `gre`/`ipip`/`sit`/`gre6`/`ip6ip6` بدون `--psk` **رمزنگاری نمی‌شن** (plain). با دادن یه `--psk` مشترک (یک مقدار روی هر دو طرف) با IPsec رمز می‌شن.
 
@@ -161,14 +142,9 @@ sudo abtunnel health --unit abtunnel-stunnel --watch-port 3306
 
 ## ➡️ فوروارد ترافیک به داخل تانل
 
-**در منوی ساده، فوروارد خودکار انجام می‌شه:**
-- **Backhaul:** همون پورت‌هایی که موقع ساخت تانل وارد می‌کنی، خودکار به سرویس سرور دوم می‌رسن (نیازی به کار اضافه نیست؛ سرویس می‌تونه روی `127.0.0.1` هم باشه).
-- **OpenVPN:** موقع ساخت تانل می‌پرسه «یک سرویس از سرور دوم را باز کنم؟»؛ اگه بله بگی، پورت‌ها خودکار به داخل تانل فوروارد می‌شن. (سرویس سرور دوم باید روی `0.0.0.0` گوش بده، نه فقط `127.0.0.1`.)
-- **GRE/IPIP (منوی پیشرفته):** موقع ساخت، پورت‌های فوروارد رو می‌پرسه و خودکار می‌سازه.
+وقتی یه تانل اینترفیسی (gre/ipip/sit/gre6/ip6ip6/openvpn) بالا میاد، **فوروارد کرنل (IPv4+IPv6) خودکار فعال می‌شه**.
 
-وقتی یه تانل اینترفیسی (gre/ipip/sit/gre6/ip6ip6/openvpn) بالا میاد، **فوروارد کرنل (IPv4+IPv6) هم خودکار فعال می‌شه**.
-
-اگه خواستی دستی یه پورت دیگه اضافه کنی (DNAT + MASQUERADE، پایدار و خودکار روی ریبوت):
+برای اینکه ترافیک یه پورت از این سرور به داخل تانل و به سرویس مقصد روی سرور مقابل بره، یه port-forward بساز (DNAT + MASQUERADE، پایدار و خودکار روی ریبوت):
 
 ```bash
 # مثال: هر چی روی این سرور به پورت 3306 بیاد، از تانل بره به دیتابیسِ سرور مقابل
@@ -265,7 +241,7 @@ sudo wg-tunnel client --endpoint <B_IP> --port 51820 --pubkey <B_PUBKEY>
 
 ---
 
-## 🚀 Backhaul Reverse Tunnel (جدید)
+## 🚀 TunLink Reverse Tunnel (جدید)
 
 یک تانل reverse با عملکرد بالا که به tunxall اضافه شده:
 
@@ -281,7 +257,7 @@ sudo abtunnel
 # 1) Set up a tunnel (guided)
 # → SERVER یا CLIENT
 # → IPv4
-# → 9) backhaul
+# → 9) tunlink
 ```
 
 ### حالت چندسروره (Auto-Select)
@@ -299,24 +275,24 @@ Token: <token از سرور>
 
 ```bash
 # سرور
-sudo abtunnel backhaul server --accept-port 3080 --psk mytoken
+sudo abtunnel tunlink server --accept-port 3080 --psk mytoken
 
 # کلاینت تکی
-sudo abtunnel backhaul client --peer 1.2.3.4 --accept-port 3080 --psk mytoken
+sudo abtunnel tunlink client --peer 1.2.3.4 --accept-port 3080 --psk mytoken
 
 # کلاینت چندسروره (با متغیر محیطی)
-PEERS="1.2.3.4:3080,5.6.7.8:3080" PSK=mytoken sudo abtunnel backhaul client
+PEERS="1.2.3.4:3080,5.6.7.8:3080" PSK=mytoken sudo abtunnel tunlink client
 ```
 
 ### مدیریت
 
 ```bash
 sudo abtunnel status
-sudo abtunnel down backhaul
-systemctl status abtunnel-backhaul
+sudo abtunnel down tunlink
+systemctl status abtunnel-tunlink
 ```
 
-کد منبع Backhaul داخل پوشه `backhaul/` قرار دارد و هنگام نصب (در صورت وجود Go) بیلد می‌شود.
+کد منبع TunLink داخل پوشه `tunlink/` قرار دارد و هنگام نصب (در صورت وجود Go) بیلد می‌شود.
 
 ---
 
@@ -333,7 +309,7 @@ systemctl status abtunnel-backhaul
 منو → [6] سوئیچ خودکار (Failover) → فعال‌سازی
 ```
 
-ترتیب پیش‌فرض: `backhaul → openvpn → gre → ipip`
+ترتیب پیش‌فرض: `tunlink → openvpn → gre → ipip`
 
 - چک سلامت هر ۲۰ ثانیه
 - بعد از ۳ بار شکست متوالی → سوئیچ
@@ -344,4 +320,129 @@ systemctl status abtunnel-backhaul
 sudo bash /opt/tunxall/failover.sh install   # فعال
 sudo bash /opt/tunxall/failover.sh status   # وضعیت
 sudo bash /opt/tunxall/failover.sh stop     # خاموش
+```
+
+---
+
+## 🛡️ پروتکل HTTPS Camouflage (اختصاصی)
+
+وقتی بقیه پروتکل‌ها توسط DPI یا فایروال بسته می‌شوند:
+
+- روی پورت تانل یک **صفحه وب واقعی** سرو می‌شود (برای اسکنر/مرورگر)
+- تانل فقط از مسیر `/tunnel` با هدر توکن برقرار می‌شود
+- ظاهر ترافیک مثل HTTPS معمولی است (TLS + WebSocket)
+
+در منو: **ساخت تانل جدید → گزینه ۳**
+
+## جداسازی پورت تانل از پورت پنل
+
+دیگر لازم نیست پورت تانل با پورت inbound/پنل یکی باشد:
+
+| مفهوم | معنی | مثال |
+|--------|------|------|
+| **پورت تانل** | فقط بین دو سرور شما | `443` یا `3080` |
+| **پورت پنل / inbound** | کاربرها و پنل به سرور اول | `2096,8080` |
+| **مقصد روی کلاینت** | سرویس واقعی پشت NAT | `443=127.0.0.1:8443` |
+
+مثال مپینگ:
+```
+443,8080,2096
+443=127.0.0.1:8443
+20000-20010=127.0.0.1:8080
+```
+
+---
+
+## 📡 حالت بدون پینگ (No-Ping)
+
+خیلی از دیتاسنترها **ICMP (پینگ)** را بین سرورها می‌بندند، ولی **TCP** باز است.
+
+- گزینه منو: **📡 بدون پینگ (No-Ping)**
+- فقط از TCP + heartbeat کانال کنترل استفاده می‌کند
+- تست سلامت و Failover هم **به پینگ وابسته نیستند** (اول TCP، بعد لاگ کانال کنترل)
+
+پروتکل‌های reverse مثل TCP / HTTPS Camouflage اصولاً نیازی ندارند سرور اول بتواند کلاینت را پینگ کند؛ کلاینت خودش به بیرون وصل می‌شود.
+
+---
+
+## 🔀 Shape — دستکاری اندازه پکت (ضد انگشت VPN)
+
+روی مسیر دادهٔ تانل، ترافیک دیگر ۱:۱ با دادهٔ اصلی نیست:
+
+- هر فریم: `طول‌داده + طول‌پدینگ + داده + بایت تصادفی`
+- تکه‌تکه شدن تصادفی writeها
+- فریم‌های خالی دوره‌ای (cover traffic) برای شلوغ‌کردن الگوی زمانی/حجمی
+
+نتیجه: الگوی سایز پکت شبیه VPNهای کلاسیک (OpenVPN/WireGuard با سایز ثابت‌تر) کمتر دیده می‌شود. همراه **HTTPS Camouflage** یا **No-Ping** مؤثرتر است.
+
+این لایه به‌صورت پیش‌فرض روی کپی دوطرفهٔ داده فعال است.
+
+---
+
+## توسعه جدید — Doctor و پروفایل شبکه سخت
+
+منوی اصلی:
+
+| گزینه | کار |
+|--------|-----|
+| عیب‌یابی سریع (Doctor) | سرویس، TCP تا peer، کانال کنترل، failover — **بدون پینگ** |
+| ری‌استارت تانل | ری‌استارت انتخابی |
+| پروفایل شبکه سخت | راهنمای پیشنهادی DPI / بدون پینگ |
+
+خط فرمان:
+```bash
+sudo abtunnel doctor
+sudo abtunnel restart
+```
+
+`obfuscate = true` در config سرور/کلاینت نوشته می‌شود (Shape / پدینگ پکت).
+
+---
+
+## سه قابلیت جدید
+
+### ۱) پنل وب وضعیت
+منو → **پنل وب وضعیت** یا:
+```bash
+sudo bash /opt/tunxall/webpanel.sh install
+# باز کردن: http://SERVER_IP:9090/
+```
+نمایش سرویس‌ها، failover، صندوق توکن و خلاصه config — هر ۱۵ ثانیه رفرش.
+
+### ۲) چند توکن همزمان (Token Vault)
+هر بار ساخت تانل، توکن با برچسب در `/etc/abtunnel/tokens/` ذخیره می‌شود.
+منو → **صندوق توکن‌ها** برای مشاهده و فعال‌کردن دوباره.
+
+### ۳) پروفایل یک‌کلیکی شبکه سخت
+منو → **پروفایل شبکه سخت (یک‌کلیکی)** یا `sudo abtunnel hardnet`
+
+خودکار:
+- transport = `https` (Camouflage)
+- پورت تانل `443` / پنل `2096,8080`
+- Shape/obfuscate روشن
+- Failover نصب و فعال
+- صدور توکن
+
+---
+
+## تنظیمات پروکسی تانل
+
+منو → **۱۰) تنظیمات پروکسی تانل**
+
+| نوع | مثال | کاربرد |
+|-----|------|--------|
+| SOCKS5 | `socks5://127.0.0.1:1080` | کلاینت از طریق SOCKS به سرور وصل شود |
+| HTTP CONNECT | `http://user:pass@proxy:8080` | پروکسی سازمانی / HTTP |
+| Edge IP | IP لبه CDN | TCP به IP، Host/SNI روی دامنه سرور |
+
+در `client.toml`:
+```toml
+proxy = "socks5://127.0.0.1:1080"
+# یا
+edge_ip = "1.2.3.4"
+```
+
+هنگام ساخت کلاینت:
+```bash
+PROXY=socks5://127.0.0.1:1080 sudo abtunnel connect <TOKEN>
 ```

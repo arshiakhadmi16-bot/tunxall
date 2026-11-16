@@ -1,0 +1,55 @@
+# Builds the tunlink binary for Linux and publishes it as the rolling
+# "tunlink-latest" release, so install.sh can download it instead of needing Go.
+name: tunlink release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tunlink/**"
+      - ".github/workflows/tunlink-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tunlink-release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tunlink
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tunlink/go.mod
+          cache-dependency-path: tunlink/go.sum
+
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Build
+        run: |
+          mkdir -p ../dist
+          for arch in amd64 arm64 386 arm; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch \
+              go build -trimpath -ldflags "-s -w" -o ../dist/tunlink-linux-$arch .
+          done
+          cd ../dist && sha256sum tunlink-linux-* > SHA256SUMS && cat SHA256SUMS
+
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: dist
+        run: |
+          gh release delete tunlink-latest --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+          gh release create tunlink-latest tunlink-linux-* SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "tunlink (latest build)" \
+            --notes "Prebuilt tunlink binaries for Linux, built from ${GITHUB_SHA}. Downloaded automatically by install.sh."

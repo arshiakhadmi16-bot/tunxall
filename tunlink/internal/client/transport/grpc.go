@@ -19,6 +19,7 @@ import (
 type GrpcClientConfig struct {
 	RemoteAddr    string
 	Token         string
+	Obfuscate     bool
 	KeepAlive     time.Duration
 	RetryInterval time.Duration
 	DialTimeOut   time.Duration
@@ -144,5 +145,5 @@ func (c *GrpcClient) tunnelDialer(sess *clientSession) {
 		conn.Close()
 		return
 	}
-	handlers.TCPConnectionHandler(c.ctx, false, conn, localConn, c.logger, 0, false)
+	handlers.TCPConnectionHandler(c.ctx, false, localConn, conn, c.logger, 0, false, c.config.Obfuscate)
 }

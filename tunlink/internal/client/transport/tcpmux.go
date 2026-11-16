@@ -18,6 +18,7 @@ import (
 type TcpMuxClientConfig struct {
 	RemoteAddr       string
 	Token            string
+	Obfuscate        bool
 	KeepAlive        time.Duration
 	RetryInterval    time.Duration
 	DialTimeOut      time.Duration
@@ -176,5 +177,5 @@ func (c *TcpMuxClient) handleStream(stream *smux.Stream) {
 		stream.Close()
 		return
 	}
-	handlers.TCPConnectionHandler(c.ctx, false, stream, localConn, c.logger, 0, false)
+	handlers.TCPConnectionHandler(c.ctx, false, localConn, stream, c.logger, 0, false, c.config.Obfuscate)
 }

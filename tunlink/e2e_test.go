@@ -96,16 +96,23 @@ func waitRoundTrip(t *testing.T, addr string) {
 
 func startPair(t *testing.T, ctx context.Context, tr config.TransportType, bindPort, publicPort, echoPort int) {
 	t.Helper()
+	startPairOpts(t, ctx, tr, bindPort, publicPort, echoPort, false)
+}
+
+func startPairOpts(t *testing.T, ctx context.Context, tr config.TransportType, bindPort, publicPort, echoPort int, obfuscate bool) {
+	t.Helper()
 	srvCfg := &config.ServerConfig{
 		BindAddr: fmt.Sprintf("127.0.0.1:%d", bindPort), Transport: tr, Token: testToken,
 		Ports:     []string{fmt.Sprintf("127.0.0.1:%d=%d", publicPort, echoPort)},
 		Keepalive: 75, Heartbeat: 2, ChannelSize: 128, MuxCon: 4, LogLevel: "error",
+		Obfuscate: obfuscate,
 	}
 	go server.NewServer(srvCfg, ctx).Start()
 
 	cliCfg := &config.ClientConfig{
 		RemoteAddr: fmt.Sprintf("127.0.0.1:%d", bindPort), Transport: tr, Token: testToken,
 		ConnectionPool: 2, RetryInterval: 1, Keepalive: 75, DialTimeout: 2, LogLevel: "error",
+		Obfuscate: obfuscate,
 	}
 	go client.NewClient(cliCfg, ctx).Start()
 }
@@ -172,7 +179,7 @@ func TestHealthProbe(t *testing.T) {
 			switch tr {
 			case config.WS:
 				dial = func(ctx context.Context, addr string, timeout time.Duration) (net.Conn, error) {
-					return clienttransport.DialWS(ctx, "ws", addr, "", timeout)
+					return clienttransport.DialWS(ctx, "ws", addr, "", testToken, "", timeout)
 				}
 			case config.GRPC:
 				dial = func(ctx context.Context, addr string, timeout time.Duration) (net.Conn, error) {
@@ -300,5 +307,89 @@ func TestGRPCSBulkTransfer(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatal("payload corrupted in transit")
+	}
+}
+
+// ackServer is a non-echo backend: it answers each line with "ack:<line>".
+// Unlike an echo server it cannot hide framing bugs (an echo bounces any
+// extra framing straight back, so a broken wrapper still round-trips).
+func ackServer(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				r := bufio.NewReader(c)
+				for {
+					line, err := r.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if _, err := io.WriteString(c, "ack:"+line); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+func ackRoundTrip(addr, msg string) error {
+	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := fmt.Fprintf(c, "%s\n", msg); err != nil {
+		return err
+	}
+	line, err := bufio.NewReader(c).ReadString('\n')
+	if err != nil {
+		return err
+	}
+	if line != "ack:"+msg+"\n" {
+		return fmt.Errorf("got %q, want %q", line, "ack:"+msg+"\n")
+	}
+	return nil
+}
+
+// With obfuscate enabled on both ends the backend must see exactly the bytes
+// the user sent (padding is only on the tunnel leg), and vice versa.
+func TestObfuscatedTunnelDeliversExactBytes(t *testing.T) {
+	for _, tr := range allTransports {
+		t.Run(string(tr), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			bindPort, publicPort, backendPort := freePort(t), freePort(t), ackServer(t)
+			startPairOpts(t, ctx, tr, bindPort, publicPort, backendPort, true)
+			public := fmt.Sprintf("127.0.0.1:%d", publicPort)
+
+			deadline := time.Now().Add(10 * time.Second)
+			var err error
+			for time.Now().Before(deadline) {
+				if err = ackRoundTrip(public, "hello"); err == nil {
+					break
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+			if err != nil {
+				t.Fatalf("obfuscated tunnel corrupted traffic: %v", err)
+			}
+			big := string(bytes.Repeat([]byte("x"), 5000))
+			if err := ackRoundTrip(public, big); err != nil {
+				t.Fatalf("large payload: %v", err)
+			}
+		})
 	}
 }

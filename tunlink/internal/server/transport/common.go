@@ -42,6 +42,7 @@ type controlServer struct {
 	controlCh      chan net.Conn // unbuffered: a send succeeds only while no session is active
 	reqNewConnChan chan struct{}
 	localChannel   chan LocalTCPConn
+	obfuscate      bool // wrap tunnel connections with padding framing
 }
 
 func newControlServer(ctx context.Context, token string, heartbeat time.Duration, channelSize int, logger *logrus.Logger) controlServer {
@@ -237,7 +238,7 @@ func (s *controlServer) handleLoop(tunnelChannel chan net.Conn, proxyProtocol bo
 					localConn.conn.Close()
 					continue
 				}
-				go handlers.TCPConnectionHandler(s.ctx, proxyProtocol, localConn.conn, tunnelConn, s.logger, 0, false)
+				go handlers.TCPConnectionHandler(s.ctx, proxyProtocol, localConn.conn, tunnelConn, s.logger, 0, false, s.obfuscate)
 			}
 		}
 	}

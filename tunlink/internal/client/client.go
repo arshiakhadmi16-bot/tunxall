@@ -102,6 +102,7 @@ func (c *Client) startTransport(remoteAddr string) {
 		cfg := &transport.TcpConfig{
 			RemoteAddr:     remoteAddr,
 			Token:          c.config.Token,
+			Obfuscate:      c.config.Obfuscate,
 			KeepAlive:      time.Duration(c.config.Keepalive) * time.Second,
 			RetryInterval:  time.Duration(c.config.RetryInterval) * time.Second,
 			DialTimeOut:    time.Duration(c.config.DialTimeout) * time.Second,
@@ -111,6 +112,7 @@ func (c *Client) startTransport(remoteAddr string) {
 			MSS:            c.config.MSS,
 			SO_RCVBUF:      c.config.SO_RCVBUF,
 			SO_SNDBUF:      c.config.SO_SNDBUF,
+			Proxy:          c.config.Proxy,
 		}
 		cl := transport.NewTCPClient(ctx, cfg, c.logger)
 		cl.Start()
@@ -119,6 +121,7 @@ func (c *Client) startTransport(remoteAddr string) {
 		cfg := &transport.TcpMuxClientConfig{
 			RemoteAddr:       remoteAddr,
 			Token:            c.config.Token,
+			Obfuscate:        c.config.Obfuscate,
 			KeepAlive:        time.Duration(c.config.Keepalive) * time.Second,
 			RetryInterval:    time.Duration(c.config.RetryInterval) * time.Second,
 			DialTimeOut:      time.Duration(c.config.DialTimeout) * time.Second,
@@ -133,10 +136,11 @@ func (c *Client) startTransport(remoteAddr string) {
 		cl := transport.NewMuxClient(ctx, cfg, c.logger)
 		cl.Start()
 
-	case config.WS, config.WSS:
+	case config.WS, config.WSS, config.HTTPS:
 		cfg := &transport.WsClientConfig{
 			RemoteAddr:     remoteAddr,
 			Token:          c.config.Token,
+			Obfuscate:      c.config.Obfuscate,
 			KeepAlive:      time.Duration(c.config.Keepalive) * time.Second,
 			RetryInterval:  time.Duration(c.config.RetryInterval) * time.Second,
 			DialTimeOut:    time.Duration(c.config.DialTimeout) * time.Second,
@@ -145,6 +149,7 @@ func (c *Client) startTransport(remoteAddr string) {
 			AggressivePool: c.config.AggressivePool,
 			Mode:           string(c.config.Transport),
 			EdgeIP:         c.config.EdgeIP,
+			Proxy:          c.config.Proxy,
 		}
 		cl := transport.NewWSClient(ctx, cfg, c.logger)
 		cl.Start()
@@ -153,6 +158,7 @@ func (c *Client) startTransport(remoteAddr string) {
 		cfg := &transport.GrpcClientConfig{
 			RemoteAddr:    remoteAddr,
 			Token:         c.config.Token,
+			Obfuscate:     c.config.Obfuscate,
 			KeepAlive:     time.Duration(c.config.Keepalive) * time.Second,
 			RetryInterval: time.Duration(c.config.RetryInterval) * time.Second,
 			DialTimeOut:   time.Duration(c.config.DialTimeout) * time.Second,
@@ -201,10 +207,10 @@ func (c *Client) logStats() {
 // probeDialer returns how the health checker reaches a server for the configured transport.
 func (c *Client) probeDialer() health.DialFunc {
 	switch c.config.Transport {
-	case config.WS, config.WSS:
+	case config.WS, config.WSS, config.HTTPS:
 		mode := string(c.config.Transport)
 		return func(ctx context.Context, addr string, timeout time.Duration) (net.Conn, error) {
-			return transport.DialWS(ctx, mode, addr, "", timeout)
+			return transport.DialWS(ctx, mode, addr, "", c.config.Token, c.config.Proxy, timeout)
 		}
 	case config.GRPC, config.GRPCS:
 		secure := c.config.Transport == config.GRPCS

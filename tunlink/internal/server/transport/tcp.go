@@ -16,6 +16,7 @@ import (
 type TcpConfig struct {
 	BindAddr      string
 	Token         string
+	Obfuscate     bool
 	Ports         []string
 	Nodelay       bool
 	KeepAlive     time.Duration
@@ -39,6 +40,7 @@ type TcpTransport struct {
 func NewTCPServer(parentCtx context.Context, config *TcpConfig, logger *logrus.Logger) *TcpTransport {
 	ctx, cancel := context.WithCancel(parentCtx)
 	cs := newControlServer(ctx, config.Token, config.Heartbeat, config.ChannelSize, logger)
+	cs.obfuscate = config.Obfuscate
 	return &TcpTransport{
 		controlServer: cs,
 		config:        config,
